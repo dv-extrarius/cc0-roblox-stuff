@@ -53,8 +53,7 @@ function Heap:peek(): (any, number)
 end
 
 --Utility function used by pop to (destructively) meld two heaps into one new heap
-local function _Meld<T>(heap1: PairingHeapNode, heap2: PairingHeapNode): PairingHeapNode
-	--print("Melding (", heap1.value, " @ ", heap1.priority, ") with (", heap2.value, " @ ", heap2.priority, ")")
+local function _Meld(heap1: PairingHeapNode, heap2: PairingHeapNode): PairingHeapNode
 	if heap1.value == nil then
 		return heap2
 	elseif heap2.value == nil then
@@ -88,7 +87,6 @@ end
 function Heap:pop(): (any, number)
 	local value = self.value
 	local priority = self.priority
-	--print("Popping value ", value)
 	if (self.value ~= nil) and (#self.subheaps > 0) then
 		local heap = _MergePairs(self.subheaps)
 		self.value = heap.value
