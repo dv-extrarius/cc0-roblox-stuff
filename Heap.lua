@@ -22,18 +22,18 @@ type HeapImpl = {
 	pop: (self: Heap) -> (any, number),
 	_Test: () -> ()
 }
-type Heap = typeof(setmetatable({} :: PairingHeapNode, {} :: HeapImpl))
+export type Heap = typeof(setmetatable({} :: PairingHeapNode, {} :: HeapImpl))
 
-local Heap: HeapImpl = {} :: HeapImpl
-Heap.__index = Heap
+local HeapLib: HeapImpl = {} :: HeapImpl
+HeapLib.__index = HeapLib
 
 --Construct a new empty Heap
-function Heap.new(): Heap
-	return setmetatable({value = nil, priority = -math.huge, subheaps = {}} :: PairingHeapNode, Heap)
+function HeapLib.new(): Heap
+	return setmetatable({value = nil, priority = -math.huge, subheaps = {}} :: PairingHeapNode, HeapLib)
 end
 
 --Insert an element
-function Heap:push(priority: number, value: any)
+function HeapLib:push(priority: number, value: any)
 	if self.value == nil then
 		self.value = value
 		self.priority = priority
@@ -48,7 +48,7 @@ function Heap:push(priority: number, value: any)
 end
 
 --Peek at the highest priority element
-function Heap:peek(): (any, number)
+function HeapLib:peek(): (any, number)
 	return self.value, self.priority
 end
 
@@ -84,7 +84,7 @@ local function _MergePairs(list: {PairingHeapNode}): PairingHeapNode
 end
 
 --Remove the highest priority element and return the value and prority
-function Heap:pop(): (any, number)
+function HeapLib:pop(): (any, number)
 	local value = self.value
 	local priority = self.priority
 	if (self.value ~= nil) and (#self.subheaps > 0) then
@@ -100,8 +100,8 @@ function Heap:pop(): (any, number)
 	return value, priority
 end
 
-function Heap._Test()
-	local h = Heap.new()
+function HeapLib._Test()
+	local h = HeapLib.new()
 
 	--Test popping empty is nil
 	assert(h:pop() == nil)
@@ -255,4 +255,4 @@ function Heap._Test()
 end
 
 
-return Heap
+return HeapLib
