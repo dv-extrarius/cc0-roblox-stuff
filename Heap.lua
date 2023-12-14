@@ -3,7 +3,7 @@ Copyright Extrarius 2023.
 This work is marked with CC0 1.0 Universal.
 To view a copy of this license, visit http://creativecommons.org/publicdomain/zero/1.0
 --
-This is an implementation of a pairing max-heap, which has constant time insertion.
+This is an implementation of a pairing min-heap, which has constant time insertion.
 Algorithms implemented from https://en.wikipedia.org/wiki/Pairing_heap
 The algorithms were modified to create fewer temporaries, thus reducing garbage generated.
 ]]
@@ -11,54 +11,72 @@ The algorithms were modified to create fewer temporaries, thus reducing garbage 
 --!strict
 
 --The base node type used to build the heap
-type PairingHeapNode = {value: any?, priority: number, subheaps: {PairingHeapNode}}
+export type HeapNode = {value: any?, priority: number, subheaps: {HeapNode}}
+export type Heap = HeapNode
 
 --The type this module creates
-type HeapImpl = {
-	__index: HeapImpl,
+type HeapLib = {
+	__index: HeapLib,
 	new: () -> Heap,
 	push: (self: Heap, priority: number, value: any) -> (),
 	peek: (self: Heap) -> (any, number),
+	isEmpty: (self: Heap) -> boolean,
 	pop: (self: Heap) -> (any, number),
 	_Test: () -> ()
 }
-export type Heap = typeof(setmetatable({} :: PairingHeapNode, {} :: HeapImpl))
 
-local HeapLib: HeapImpl = {} :: HeapImpl
+local HeapLib: HeapLib = {} :: HeapLib
 HeapLib.__index = HeapLib
 
 --Construct a new empty Heap
 function HeapLib.new(): Heap
-	return setmetatable({value = nil, priority = -math.huge, subheaps = {}} :: PairingHeapNode, HeapLib)
+	return {
+		value = nil,
+		priority = math.huge,
+		subheaps = {}
+	} :: HeapNode
 end
 
 --Insert an element
-function HeapLib:push(priority: number, value: any)
+function HeapLib.push(self: Heap, priority: number, value: any)
 	if self.value == nil then
 		self.value = value
 		self.priority = priority
 		self.subheaps = {}
-	elseif self.priority > priority then
-		table.insert(self.subheaps, {value = value, priority = priority, subheaps = {}} :: PairingHeapNode)
+	elseif self.priority < priority then
+		table.insert(self.subheaps, {
+			value = value,
+			priority = priority,
+			subheaps = {}
+		} :: HeapNode)
 	else
-		table.insert(self.subheaps, {value = self.value, priority = self.priority, subheaps = {}} :: PairingHeapNode)
+		table.insert(self.subheaps, {
+			value = self.value,
+			priority = self.priority,
+			subheaps = {}
+		} :: HeapNode)
 		self.value = value
 		self.priority = priority
 	end
 end
 
---Peek at the highest priority element
-function HeapLib:peek(): (any, number)
+--peek at the lowest priority element
+function HeapLib.peek(self: Heap): (any, number)
 	return self.value, self.priority
 end
 
+--peek at the lowest priority element
+function HeapLib.isEmpty(self: Heap): boolean
+	return (self.value ~= nil)
+end
+
 --Utility function used by pop to (destructively) meld two heaps into one new heap
-local function _Meld(heap1: PairingHeapNode, heap2: PairingHeapNode): PairingHeapNode
+local function _Meld(heap1: HeapNode, heap2: HeapNode): HeapNode
 	if heap1.value == nil then
 		return heap2
 	elseif heap2.value == nil then
 		return heap1
-	elseif heap1.priority > heap2.priority then
+	elseif heap1.priority < heap2.priority then
 		table.insert(heap1.subheaps, heap2)
 		return heap1
 	else
@@ -68,35 +86,43 @@ local function _Meld(heap1: PairingHeapNode, heap2: PairingHeapNode): PairingHea
 end
 
 --Utility function used by pop to (destructively) remerge sub-heaps
-local function _MergePairs(list: {PairingHeapNode}): PairingHeapNode
+local function _mergePairs(list: {HeapNode}): HeapNode
 	while #list > 1 do
-		local results = table.create((#list + 1) // 2)
-		local numresults = (#list + 1) // 2
-		for ii = 1,#list-1,2 do
-			results[(ii + 1) // 2] = _Meld(list[ii], list[ii+1])
+		local listsize = #list
+		local numresults = (listsize + 1) // 2
+		local results = table.create(numresults)
+
+		for ii = 2,listsize,2 do
+			results[ii / 2] = _Meld(list[ii-1], list[ii])
 		end
-		if #list % 2 == 1 then
-			results[numresults] = list[#list]
+
+		if listsize % 2 == 1 then
+			results[numresults] = list[listsize]
 		end
+
 		list = results
 	end
+
 	return list[1]
 end
 
---Remove the highest priority element and return the value and prority
-function HeapLib:pop(): (any, number)
+--Remove the lowest priority element and return the value and prority
+function HeapLib.pop(self: Heap): (any, number)
 	local value = self.value
 	local priority = self.priority
-	if (self.value ~= nil) and (#self.subheaps > 0) then
-		local heap = _MergePairs(self.subheaps)
+	local subheaps = self.subheaps
+
+	if (value ~= nil) and (#subheaps > 0) then
+		local heap = _mergePairs(subheaps)
 		self.value = heap.value
 		self.priority = heap.priority
 		self.subheaps = heap.subheaps
 	else
 		self.value = nil
-		self.priority = -math.huge
+		self.priority = math.huge
 		self.subheaps = {}
 	end
+
 	return value, priority
 end
 
@@ -104,96 +130,96 @@ function HeapLib._Test()
 	local h = HeapLib.new()
 
 	--Test popping empty is nil
-	assert(h:pop() == nil)
+	assert(HeapLib.pop(h) == nil)
 
 	--Test next most basic scenario, 
-	h:push(0, "A")
-	assert(h:pop() == "A")
+	HeapLib.push(h, 0, "A")
+	assert(HeapLib.pop(h) == "A")
 
 	--All permutations of 2-element priorities
-	h:push(0, "A")
-	h:push(1, "B")
-	assert(h:pop() == "B")
-	assert(h:pop() == "A")
+	HeapLib.push(h, 0, "A")
+	HeapLib.push(h, 1, "B")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "B")
 
-	h:push(1, "A")
-	h:push(0, "B")
-	assert(h:pop() == "A")
-	assert(h:pop() == "B")
+	HeapLib.push(h, 1, "A")
+	HeapLib.push(h, 0, "B")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "A")
 
 	--All permutations of 3-element priorities
-	h:push(0, "A")
-	h:push(1, "B")
-	h:push(2, "C")
-	assert(h:pop() == "C")
-	assert(h:pop() == "B")
-	assert(h:pop() == "A")
+	HeapLib.push(h, 0, "A")
+	HeapLib.push(h, 1, "B")
+	HeapLib.push(h, 2, "C")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "C")
 
-	h:push(0, "A")
-	h:push(2, "B")
-	h:push(1, "C")
-	assert(h:pop() == "B")
-	assert(h:pop() == "C")
-	assert(h:pop() == "A")
+	HeapLib.push(h, 0, "A")
+	HeapLib.push(h, 2, "B")
+	HeapLib.push(h, 1, "C")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "C")
+	assert(HeapLib.pop(h) == "B")
 
-	h:push(1, "A")
-	h:push(0, "B")
-	h:push(2, "C")
-	assert(h:pop() == "C")
-	assert(h:pop() == "A")
-	assert(h:pop() == "B")
+	HeapLib.push(h, 1, "A")
+	HeapLib.push(h, 0, "B")
+	HeapLib.push(h, 2, "C")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "C")
 
-	h:push(2, "A")
-	h:push(0, "B")
-	h:push(1, "C")
-	assert(h:pop() == "A")
-	assert(h:pop() == "C")
-	assert(h:pop() == "B")
+	HeapLib.push(h, 2, "A")
+	HeapLib.push(h, 0, "B")
+	HeapLib.push(h, 1, "C")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "C")
+	assert(HeapLib.pop(h) == "A")
 
-	h:push(1, "A")
-	h:push(2, "B")
-	h:push(0, "C")
-	assert(h:pop() == "B")
-	assert(h:pop() == "A")
-	assert(h:pop() == "C")
+	HeapLib.push(h, 1, "A")
+	HeapLib.push(h, 2, "B")
+	HeapLib.push(h, 0, "C")
+	assert(HeapLib.pop(h) == "C")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "B")
 
-	h:push(2, "A")
-	h:push(1, "B")
-	h:push(0, "C")
-	assert(h:pop() == "A")
-	assert(h:pop() == "B")
-	assert(h:pop() == "C")
+	HeapLib.push(h, 2, "A")
+	HeapLib.push(h, 1, "B")
+	HeapLib.push(h, 0, "C")
+	assert(HeapLib.pop(h) == "C")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "A")
 
 	--Test pushing more elements out of order
-	h:push(10, "A")
-	h:push(5, "B")
-	h:push(7, "C")
-	h:push(15, "D")
-	h:push(1, "E")
-	assert(h:pop() == "D")
-	assert(h:pop() == "A")
-	assert(h:pop() == "C")
-	assert(h:pop() == "B")
-	assert(h:pop() == "E")
+	HeapLib.push(h, 10, "A")
+	HeapLib.push(h, 5, "B")
+	HeapLib.push(h, 7, "C")
+	HeapLib.push(h, 15, "D")
+	HeapLib.push(h, 1, "E")
+	assert(HeapLib.pop(h) == "E")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "C")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "D")
 
 	--Test pushing non-empty heap
-	h:push(10, "A")
-	h:push(5, "B")
-	h:push(7, "C")
-	h:push(15, "D")
-	assert(h:pop() == "D")
-	assert(h:pop() == "A")
-	h:push(6, "E")
-	h:push(1, "F")
-	h:push(20, "G")
-	assert(h:pop() == "G")
-	assert(h:pop() == "C")
-	assert(h:pop() == "E")
-	assert(h:pop() == "B")
-	assert(h:pop() == "F")
+	HeapLib.push(h, 10, "A")
+	HeapLib.push(h, 5, "B")
+	HeapLib.push(h, 7, "C")
+	HeapLib.push(h, 15, "D")
+	assert(HeapLib.pop(h) == "B")
+	assert(HeapLib.pop(h) == "C")
+	HeapLib.push(h, 6, "E")
+	HeapLib.push(h, 1, "F")
+	HeapLib.push(h, 20, "G")
+	assert(HeapLib.pop(h) == "F")
+	assert(HeapLib.pop(h) == "E")
+	assert(HeapLib.pop(h) == "A")
+	assert(HeapLib.pop(h) == "D")
+	assert(HeapLib.pop(h) == "G")
 
 	--Test popping empty is still nil
-	assert(h:pop() == nil)
+	assert(HeapLib.pop(h) == nil)
 
 	--Test interspersing pops and pushes on a larger value set (values 100-199)
 	local TestValues: {number} = {
@@ -206,23 +232,23 @@ function HeapLib._Test()
 
 	local TestTracker: {number} = {}
 
-	local function SubArray(arr, start, finish)
-		return {unpack(arr, start, finish)}
+	local function SliceArray<T>(arr: {T}, start: number, finish: number): {T}
+		return table.move(arr, start, finish, 1, table.create(finish - start + 1))
 	end
 
 	local function MultiPush(start: number, finish: number)
-		for _, val in ipairs(SubArray(TestValues, start, finish)) do
-			h:push(val, val)
+		for _, val in ipairs(SliceArray(TestValues, start, finish)) do
+			HeapLib.push(h, val, val)
 			table.insert(TestTracker, val)
 		end
 	end
 
 	local function MultiPop(count: number)
-		table.sort(TestTracker, function(a: number, b: number): boolean return a > b end)
+		table.sort(TestTracker, function(a: number, b: number): boolean return a < b end)
 		for i = 1, count do
-			assert(h:pop() == TestTracker[i])
+			assert(HeapLib.pop(h) == TestTracker[i])
 		end
-		local temp = SubArray(TestTracker, count + 1, #TestTracker)
+		local temp = SliceArray(TestTracker, count + 1, #TestTracker)
 		TestTracker = temp
 	end
 
@@ -248,11 +274,11 @@ function HeapLib._Test()
 	MultiPop(#TestTracker)
 
 	--Test popping empty is still nil
-	assert(h:pop() == nil)
+	assert(HeapLib.pop(h) == nil)
 
 	--Test completed
 	print("Heap test succeeded")
 end
 
-
+table.freeze(HeapLib)
 return HeapLib
