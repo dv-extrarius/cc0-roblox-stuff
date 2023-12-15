@@ -65,9 +65,9 @@ function HeapLib.peek(self: Heap): (any, number)
 	return self.value, self.priority
 end
 
---peek at the lowest priority element
+--Test whether a heap is empty
 function HeapLib.isEmpty(self: Heap): boolean
-	return (self.value ~= nil)
+	return (self.value == nil)
 end
 
 --Utility function used by pop to (destructively) meld two heaps into one new heap
