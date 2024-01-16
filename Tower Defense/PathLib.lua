@@ -16,7 +16,7 @@ local IDX_RANDOMWEIGHT = 4
 local IDX_TOTALCOST = 5
 local IDX_BLOCKED = 6
 
-export type PathNode = {[number]: any}
+export type PathNode = {any}
 --{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean}
 export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean}
 export type PathList = {Vector3}
@@ -253,7 +253,7 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
 
     frontWave[finishNode[IDX_INDEX]] = finishNode
     finishNode[IDX_TOTALCOST] = 0
-    
+
     while next(frontWave) ~= nil do
         for index, current in frontWave do
             local TotalCost = current[IDX_TOTALCOST] + 1  + current[IDX_RANDOMWEIGHT]
@@ -276,11 +276,11 @@ end
 function PathLib.UpdateMeshCosts(mesh: PathMesh, finish: Vector3): boolean
     local finishNodePos = ToPathGridRound(finish)
     local finishNode = mesh.Nodes[CoordToIndex(finishNodePos.X, finishNodePos.Z)]
-    
+
     if not ValidateNode("Finish", finish, finishNode) then
         return false
     end
-    
+
     return UpdateMeshCosts(mesh, finishNode)
 end
 
@@ -291,7 +291,7 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
     if finishNode[IDX_TOTALCOST] ~= 0 then
         return nil
     end
-    
+
     --If the start node wasn't visited, no path can exist
     if startNode[IDX_TOTALCOST] == math.huge then
         return nil
@@ -376,12 +376,136 @@ function PathLib.FindPath(mesh: PathMesh, start: Vector3, finish: Vector3): Path
     if not ValidateNode("Finish", finish, finishNode) then
         return nil
     end
-    
+
     if not UpdateMeshCosts(mesh, finishNode) then
         return nil
     end
-    
+
     return FindPathUsingCosts(mesh, startNode, finishNode)
+end
+
+
+--[[
+    Calculate whether a line between two nodes includes only unblocked nodes.
+    The provided coordinates must be aligned to the pathing grid (ToPathGrid*)
+    Returns false iff the line crosses any grid coordinate with no node or a node marked blocked.
+    
+    Based on "A Fast Voxel Traversal Algorithm for Ray Tracing" by John Amanatides and Andrew Woo
+    Extended to be a kind of "circle cast" against the path grid by tracing two lines.
+--]]
+function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+    --Radius can't exceed 1 or nodes might be missed
+    local radius = 0.99
+    local nodes = mesh.Nodes
+    local node: PathNode
+
+    local delta = finish - start
+    --How far to step along the X and Z coordinates to get the next grid coordinate
+    local stepX = if delta.X > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
+    local stepZ = if delta.Z > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
+    --How to adjust the index to get to the cell in the corresponding direction
+    local offsetX = DeltaCoordToIndex(stepX, 0)
+    local offsetZ = DeltaCoordToIndex(0, stepZ)
+
+    local index = CoordToIndex(start.X, start.Z)
+    --If the line is horizontal or vertical, special processinng is required to avoid division by zero
+    if delta.X == 0 then
+        for z = start.Z, finish.Z, stepZ do
+            node = nodes[index]
+            if not node or node[IDX_BLOCKED] then
+                return false
+            end
+            index += offsetZ
+        end
+        return true
+    elseif delta.Z == 0 then
+        for x = start.X, finish.X, stepX do
+            node = nodes[index]
+            if not node or node[IDX_BLOCKED] then
+                return false
+            end
+            index += offsetX
+        end
+        return true
+    end
+    
+    --The change in T a step in each direction adavances.
+    local tDeltaX = stepX / delta.X
+    local tDeltaZ = stepZ / delta.Z
+
+    local du = delta.Unit --Cache the coordinate change's unit vector
+    
+    --Coordinates used for two lines adjusted based on a circle 
+    --local pAX = start.X + radius *  du.Z
+    --local pAZ = start.Z + radius * -du.X
+    --local pBX = start.X + radius * -du.Z
+    --local pBZ = start.Z + radius *  du.X
+    
+    --The T value for the next X and Z crossing for each of the lines
+    --local tMaxXA = (start.X + stepX/2 - pAX) / delta.X
+    --local tMaxZA = (start.Z + stepZ/2 - pAZ) / delta.Z
+    --local tMaxXB = (start.X + stepX/2 - pBX) / delta.X
+    --local tMaxZB = (start.Z + stepZ/2 - pBZ) / delta.Z
+    
+    --Manually simplified expressions to ensure optimality
+    local tMaxXA = (stepX/2 - radius *  du.Z) / delta.X
+    local tMaxZA = (stepZ/2 - radius * -du.X) / delta.Z
+    local tMaxXB = (stepX/2 - radius * -du.Z) / delta.X
+    local tMaxZB = (stepZ/2 - radius *  du.X) / delta.Z
+    
+    --Step line A between X and Z grid crossings, checking each node along the path
+    while (tMaxXA <= 1) or (tMaxZA <= 1) do
+        node = nodes[index]
+        if not node or node[IDX_BLOCKED] then
+            return false
+        end
+        --Advance to the nearest grid crossing, whether in X or Z direction
+        if tMaxXA < tMaxZA then
+            tMaxXA += tDeltaX
+            index += offsetX
+        else
+            tMaxZA += tDeltaZ
+            index += offsetZ
+        end
+    end
+    --Check the final node that line A hits
+    node = nodes[index]
+    if not node or node[IDX_BLOCKED] then
+        return false
+    end
+    
+    --Step line B between X and Z grid crossings, checking each node along the path
+    index = CoordToIndex(start.X, start.Z)    
+    while (tMaxXB <= 1) or (tMaxZB <= 1) do
+        node = nodes[index]
+        if not node or node[IDX_BLOCKED] then
+            return false
+        end
+        --Advance to the nearest grid crossing, whether in X or Z direction
+        if tMaxXB < tMaxZB then
+            tMaxXB += tDeltaX
+            index += offsetX
+        else
+            tMaxZB += tDeltaZ
+            index += offsetZ
+        end
+    end
+    --Check the final node that line B hits
+    node = nodes[index]
+    if not node or node[IDX_BLOCKED] then
+        return false
+    end
+
+    return true
+end
+
+--Calculate whether a line between two nodes includes only unblocked nodes.
+function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+    --Look up the start and finish locations in the node grid
+    local startNodePos = ToPathGridRound(start)
+    local finishNodePos = ToPathGridRound(finish)
+    
+    return IsLineUnblocked(mesh, startNodePos, finishNodePos)
 end
 
 
