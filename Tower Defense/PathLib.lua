@@ -134,7 +134,7 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
                     table.create(4),            --Neighbors
                     Vector3.new(x, 0, z),       --Position 
                     index,                      --Index
-                    (math.random() / 100000.0), --RandomWeight 
+                    (math.random() / 100000.0), --RandomWeight
                     math.huge,                  --TotalCost
                     false                       --Blocked
                 }
@@ -394,8 +394,8 @@ end
     Extended to be a kind of "circle cast" against the path grid by tracing two lines.
 --]]
 function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
-    --Radius can't exceed 1 or nodes might be missed
-    local radius = 0.99
+    --Radius can't exceed (or equal?) GRID_COORD_SPACING/2 or nodes might be missed
+    local radius = GRID_COORD_SPACING/2 - 0.00001
     local nodes = mesh.Nodes
     local node: PathNode
 
@@ -447,7 +447,7 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
     --local tMaxXB = (start.X + stepX/2 - pBX) / delta.X
     --local tMaxZB = (start.Z + stepZ/2 - pBZ) / delta.Z
     
-    --Manually simplified expressions to ensure optimality
+    --Manually simplified expressions
     local tMaxXA = (stepX/2 - radius *  du.Z) / delta.X
     local tMaxZA = (stepZ/2 - radius * -du.X) / delta.Z
     local tMaxXB = (stepX/2 - radius * -du.Z) / delta.X
@@ -506,6 +506,116 @@ function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3
     local finishNodePos = ToPathGridRound(finish)
     
     return IsLineUnblocked(mesh, startNodePos, finishNodePos)
+end
+
+
+--Delete a range of elements from an array
+local function DeleteArrayRange<T>(t: {T}, minIndex: number, maxIndex: number): ()
+    table.move(t, maxIndex+1, #t+(maxIndex-minIndex+1), minIndex)
+end
+
+
+--Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes 
+local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: number): (number, number)
+    local pathLen = #path
+    local p = cornerIndex
+    local n = cornerIndex
+    
+    --March both directions (towards start and finish of path) simultaneously as far as it's unblocked
+    while (p > 1) and (n < pathLen) do
+        p -= 1
+        n += 1
+        if not IsLineUnblocked(mesh, path[p], path[n]) then
+            p += 1
+            n -= 1
+            break
+        end
+    end
+    if p == n then
+        --The corner couldn't be eliminated,
+        return cornerIndex, cornerIndex
+     end
+    
+    --If the previous loop changed p and n, so the corner node can be eliminated
+    --check whether even more nodes can be eliminated in either direction
+    if p ~= n then
+        --March next point forwards (towards finish) as far as it's unblocked
+        while n < pathLen do
+            n += 1
+            if not IsLineUnblocked(mesh, path[p], path[n]) then
+                n -= 1
+                break
+            end
+        end
+        
+        --March previous point backwards (towards start) as far as it's unblocked
+        while p > 1 do
+            p -= 1
+            if not IsLineUnblocked(mesh, path[p], path[n]) then
+                p += 1
+                break
+            end
+        end
+        
+        --Return the two nodes that must be kept - everything between them can be eliminated
+        return p, n
+    end
+    --The corner couldn't be eliminated,
+    return cornerIndex, cornerIndex
+end
+
+
+--[[
+Simplify the path by using straight lines to skip nodes where possible.
+The resulting path may not closely follow the original path, but only traverses unblocked nodes.
+--]]
+function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
+    --Remove corner nodes that can be bypassed by straight line movement
+    --These corners are typically in open space and just a limitation of 4-direction movement
+    local i = 2
+    
+    while i < #path do
+        local currNode = path[i]
+        
+        --Adjecent nodes match in X or Z. If how 3 consecutive nodes match differs, it's a corner
+        if (path[i-1].X == currNode.X) ~= (currNode.X == path[i+1].X) then
+            local p, n = TrySimplifyCorner(mesh, path, i)
+            if (p+1 < n) then
+                DeleteArrayRange(path, p+1, n-1)
+                i = p --+1 will be added below so it continues with the node "n"
+            end
+        end
+        
+        i += 1
+    end
+
+    --Remove runs of nodes in a horizontal or vertical line to reduce waypoint count
+    i = 1
+    while i < #path do
+        local currNode = path[i]
+        local n = i + 1
+        
+        if(currNode.X == path[n].X) then
+            --Advance through intermediate nodes in the straight X line
+            while (n < #path) and (currNode.X == path[n+1].X) do
+                n += 1
+            end
+            
+        elseif (currNode.Z == path[n].Z) then
+            --Advance through intermediate nodes in the straight Z line
+            while (n < #path) and (currNode.Z == path[n+1].Z) do
+                n += 1
+            end
+        end
+        
+        --If the line is more than 2 nodes, delete all the middle nodes
+        if (i + 1 < n) then
+            DeleteArrayRange(path, i+1, n-1)
+        end
+        
+        i += 1
+    end
+    return path
 end
 
 
