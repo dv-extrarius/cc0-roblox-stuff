@@ -298,6 +298,8 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
     end
 
     --Follow the cheapest nodes from start finish
+    --Note that since start has a valid TotalCost, it was visited so a path exists
+    --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
     local path: {PathNode} = {startNode}
     while path[#path] ~= finishNode do
         local current = path[#path]
@@ -499,7 +501,7 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
     return true
 end
 
---Calculate whether a line between two nodes includes only unblocked nodes.
+--Calculate whether a line between two points includes only unblocked nodes.
 function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Look up the start and finish locations in the node grid
     local startNodePos = ToPathGridRound(start)
@@ -508,6 +510,27 @@ function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3
     return IsLineUnblocked(mesh, startNodePos, finishNodePos)
 end
 
+
+--Calculate whether a rectangle between to points includes only unblocked nodes.
+function PathLib.IsAreaUnblocked(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): boolean
+    local nodes = mesh.Nodes
+
+    min, max = AreaToGrid(min, max, includePartial)
+
+    for z = min.Z, max.Z, GRID_COORD_SPACING do
+        local index = CoordToIndex(min.X, z)
+
+        for x = min.X, max.X, GRID_COORD_SPACING do
+            local node = nodes[index]
+
+            if (node == nil) or node[IDX_BLOCKED] then
+                return false
+            end
+            index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+        end
+    end
+    return true
+end
 
 --Delete a range of elements from an array
 local function DeleteArrayRange<T>(t: {T}, minIndex: number, maxIndex: number): ()
