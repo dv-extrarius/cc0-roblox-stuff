@@ -29,13 +29,13 @@ local GRID_COORD_SPACING = 2
 local GRID_COORD_OFFSET = 1
 
 --[[
-Because a vector3 used as a key is is based on object identity instead of the stored position,
-we have to make our own position-to-key function. Since maps won't be huge and nodes are
-limited to integer coordinates, we can pack the 3 coordinates using some bits for each one.
-Since there are 52 mantissa bits, we chose floor(52/3) bits per coordinate, resulting in a multiplier
-of 2^17 = 131072. We keep room for 3 coordinates just in case - for now, we only use X and Z.
-Since we want max negative coordinate to map to 0, we add half the multiplier. This allows maps to span
-the region with from -65536 to +65535
+Before I knew Vector3 were value types, I made my own position-to-key system. After discovering
+they are value types, a benchmark showed my system is about 5% faster for my cast, so here it is.
+Since places won't be huge and nodes are limited to integer coordinates, we can pack the 3 coordinates
+using some bits for each one. Since there are effectively 53 mantissa bits, I chose floor(53/3) bits
+per coordinate, resulting in a multiplier of 2^17 = 131072. I keep room for 3 coordinates just in case
+- for now, we only use X and Z. Since we want max negative coordinate to map to 0, we add half the
+multiplier. This allows maps to span the region from -65536 to +65535
 ]]
 local GRID_INDEX_MUL = 131072 
 
@@ -106,10 +106,12 @@ end
 --Clone a mesh. Finalizes the nodes if the original is finialized
 function PathLib.Clone(mesh: PathMesh): PathMesh
     local newMesh: PathMesh = {Nodes = {}, IsFinalized = false}
+    local newNodes = newMesh.Nodes
 
     for index, current in mesh.Nodes do
         local node = table.clone(current)
         node[IDX_NEIGHBORS] = table.create(4)
+        newNodes[index ] = node
     end
 
     if mesh.IsFinalized then
@@ -430,31 +432,31 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
         end
         return true
     end
-    
+
     --The change in T a step in each direction adavances.
     local tDeltaX = stepX / delta.X
     local tDeltaZ = stepZ / delta.Z
 
     local du = delta.Unit --Cache the coordinate change's unit vector
-    
+
     --Coordinates used for two lines adjusted based on a circle 
     --local pAX = start.X + radius *  du.Z
     --local pAZ = start.Z + radius * -du.X
     --local pBX = start.X + radius * -du.Z
     --local pBZ = start.Z + radius *  du.X
-    
+
     --The T value for the next X and Z crossing for each of the lines
     --local tMaxXA = (start.X + stepX/2 - pAX) / delta.X
     --local tMaxZA = (start.Z + stepZ/2 - pAZ) / delta.Z
     --local tMaxXB = (start.X + stepX/2 - pBX) / delta.X
     --local tMaxZB = (start.Z + stepZ/2 - pBZ) / delta.Z
-    
+
     --Manually simplified expressions
     local tMaxXA = (stepX/2 - radius *  du.Z) / delta.X
     local tMaxZA = (stepZ/2 - radius * -du.X) / delta.Z
     local tMaxXB = (stepX/2 - radius * -du.Z) / delta.X
     local tMaxZB = (stepZ/2 - radius *  du.X) / delta.Z
-    
+
     --Step line A between X and Z grid crossings, checking each node along the path
     while (tMaxXA <= 1) or (tMaxZA <= 1) do
         node = nodes[index]
@@ -475,7 +477,7 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
     if not node or node[IDX_BLOCKED] then
         return false
     end
-    
+
     --Step line B between X and Z grid crossings, checking each node along the path
     index = CoordToIndex(start.X, start.Z)    
     while (tMaxXB <= 1) or (tMaxZB <= 1) do
@@ -506,12 +508,12 @@ function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3
     --Look up the start and finish locations in the node grid
     local startNodePos = ToPathGridRound(start)
     local finishNodePos = ToPathGridRound(finish)
-    
+
     return IsLineUnblocked(mesh, startNodePos, finishNodePos)
 end
 
 
---Calculate whether a rectangle between to points includes only unblocked nodes.
+--Calculate whether a rectangle between two points includes only unblocked nodes.
 function PathLib.IsAreaUnblocked(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): boolean
     local nodes = mesh.Nodes
 
@@ -532,6 +534,15 @@ function PathLib.IsAreaUnblocked(mesh: PathMesh, min: Vector3, max: Vector3, inc
     return true
 end
 
+
+--Calculate whether a point is reachable from the finish point used to calculate costs
+function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
+    local nodePos = ToPathGridRound(point)
+    local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
+    return (node ~= nil) and not node[IDX_BLOCKED] and (node[IDX_TOTALCOST] ~= math.huge)
+end
+
+
 --Delete a range of elements from an array
 local function DeleteArrayRange<T>(t: {T}, minIndex: number, maxIndex: number): ()
     table.move(t, maxIndex+1, #t+(maxIndex-minIndex+1), minIndex)
@@ -543,7 +554,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
     local pathLen = #path
     local p = cornerIndex
     local n = cornerIndex
-    
+
     --March both directions (towards start and finish of path) simultaneously as far as it's unblocked
     while (p > 1) and (n < pathLen) do
         p -= 1
@@ -557,8 +568,8 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
     if p == n then
         --The corner couldn't be eliminated,
         return cornerIndex, cornerIndex
-     end
-    
+    end
+
     --If the previous loop changed p and n, so the corner node can be eliminated
     --check whether even more nodes can be eliminated in either direction
     if p ~= n then
@@ -570,7 +581,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
                 break
             end
         end
-        
+
         --March previous point backwards (towards start) as far as it's unblocked
         while p > 1 do
             p -= 1
@@ -579,7 +590,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
                 break
             end
         end
-        
+
         --Return the two nodes that must be kept - everything between them can be eliminated
         return p, n
     end
@@ -596,10 +607,10 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
     --Remove corner nodes that can be bypassed by straight line movement
     --These corners are typically in open space and just a limitation of 4-direction movement
     local i = 2
-    
+
     while i < #path do
         local currNode = path[i]
-        
+
         --Adjecent nodes match in X or Z. If how 3 consecutive nodes match differs, it's a corner
         if (path[i-1].X == currNode.X) ~= (currNode.X == path[i+1].X) then
             local p, n = TrySimplifyCorner(mesh, path, i)
@@ -608,7 +619,7 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
                 i = p --+1 will be added below so it continues with the node "n"
             end
         end
-        
+
         i += 1
     end
 
@@ -617,25 +628,25 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
     while i < #path do
         local currNode = path[i]
         local n = i + 1
-        
+
         if(currNode.X == path[n].X) then
             --Advance through intermediate nodes in the straight X line
             while (n < #path) and (currNode.X == path[n+1].X) do
                 n += 1
             end
-            
+
         elseif (currNode.Z == path[n].Z) then
             --Advance through intermediate nodes in the straight Z line
             while (n < #path) and (currNode.Z == path[n+1].Z) do
                 n += 1
             end
         end
-        
+
         --If the line is more than 2 nodes, delete all the middle nodes
         if (i + 1 < n) then
             DeleteArrayRange(path, i+1, n-1)
         end
-        
+
         i += 1
     end
     return path
