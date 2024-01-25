@@ -9,6 +9,9 @@ uses a grid of nodes that are manually marked blocked or unblocked by the librar
 --!strict
 --!optimize 2
 
+local PathLib = {}
+
+--Constants used to index the PathNode type
 local IDX_NEIGHBORS = 1
 local IDX_POSITION = 2
 local IDX_INDEX = 3
@@ -16,12 +19,10 @@ local IDX_RANDOMWEIGHT = 4
 local IDX_TOTALCOST = 5
 local IDX_BLOCKED = 6
 
-export type PathNode = {any}
+type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean}
 export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean}
 export type PathList = {Vector3}
-
-local PathLib = {}
 
 --Path nodes are spaced every other stud
 local GRID_COORD_SPACING = 2
@@ -38,6 +39,29 @@ per coordinate, resulting in a multiplier of 2^17 = 131072. I keep room for 3 co
 multiplier. This allows maps to span the region from -65536 to +65535
 ]]
 local GRID_INDEX_MUL = 131072 
+
+
+--Actual module-local variables
+local EnableDebugMessages: boolean = false
+
+
+--Custom debug functions to avoid having to repeat `if EnableDebugMessages then` everywhere
+local function CustomWarn(...: any)
+    if EnableDebugMessages then
+        warn(...)
+    end
+end
+--Variadic error that also checks EnableDebugMessages
+local function CustomError(level: number, ...: any)
+    if EnableDebugMessages then
+        local args = {...}
+        local msg = ""
+        for i, arg in args do
+            args[i] = tostring(arg)
+        end
+        error(table.concat(args, ""), level + 1)
+    end
+end
 
 
 --Convert a coordinate to a node index
@@ -86,13 +110,22 @@ PathLib.ToPathGridCeil = ToPathGridCeil
 
 
 --Function to fit an area to the grid
-local function AreaToGrid(min: Vector3, max: Vector3, includePartial: boolean?): (Vector3, Vector3)
+local function AlignAreaToGrid(min: Vector3, max: Vector3, includePartial: boolean?): (Vector3, Vector3)
     local high = Vector3.new(math.max(max.X, min.X), math.max(max.Y, min.Y), math.max(max.Z, min.Z))
     local low = Vector3.new(math.min(max.X, min.X), math.min(max.Y, min.Y), math.min(max.Z, min.Z))
     if not includePartial then
         return ToPathGridCeil(low), ToPathGridFloor(high)
     else
         return ToPathGridFloor(low), ToPathGridCeil(high)
+    end
+end
+PathLib.AlignAreaToGrid = AlignAreaToGrid
+
+
+--Configure PathLib with the provided settings
+function PathLib.Configure(config: {EnableDebugMessages: boolean?}): ()
+    if config.EnableDebugMessages ~= nil then
+        EnableDebugMessages = config.EnableDebugMessages and true or false --cast to boolean
     end
 end
 
@@ -104,7 +137,7 @@ end
 
 
 --Clone a mesh. Finalizes the nodes if the original is finialized
-function PathLib.Clone(mesh: PathMesh): PathMesh
+function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
     local newMesh: PathMesh = {Nodes = {}, IsFinalized = false}
     local newNodes = newMesh.Nodes
 
@@ -114,7 +147,7 @@ function PathLib.Clone(mesh: PathMesh): PathMesh
         newNodes[index ] = node
     end
 
-    if mesh.IsFinalized then
+    if mesh.IsFinalized and not skipFinalize then
         PathLib.FinalizeMesh(newMesh)
     end
     return newMesh
@@ -125,7 +158,7 @@ end
 function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
 
-    min, max = AreaToGrid(min, max, includePartial)
+    min, max = AlignAreaToGrid(min, max, includePartial)
 
     for z = min.Z, max.Z, GRID_COORD_SPACING do
         local index = CoordToIndex(min.X, z)
@@ -186,7 +219,7 @@ end
 function PathLib.BlockNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
 
-    min, max = AreaToGrid(min, max, includePartial)
+    min, max = AlignAreaToGrid(min, max, includePartial)
 
     for z = min.Z, max.Z, GRID_COORD_SPACING do
         local index = CoordToIndex(min.X, z)
@@ -207,7 +240,7 @@ end
 function PathLib.UnblockNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
 
-    min, max = AreaToGrid(min, max, includePartial)
+    min, max = AlignAreaToGrid(min, max, includePartial)
 
     for z = min.Z, max.Z, GRID_COORD_SPACING do
         local index = CoordToIndex(min.X, z)
@@ -227,10 +260,10 @@ end
 --Utility to print warnings for invalid start/finish locations
 local function ValidateNode(label: string, location: Vector3, node: PathNode): boolean
     if node == nil then
-        warn(label, " point of (", location, ") is outside path nodes")
+        CustomWarn(label, " point of (", location, ") is outside path nodes")
         return false
     elseif node[IDX_BLOCKED] then
-        warn(label, " node at (", location, ") is blocked!")
+        CustomWarn(label, " node at (", location, ") is blocked!")
         return false
     end
     return true
@@ -241,6 +274,7 @@ end
 local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
     --Finding a path requires a finalized mesh
     if not mesh.IsFinalized then
+        CustomError(1, "Attempted UpdateMeshCosts without finalizing the mesh.")
         return false
     end
 
@@ -270,6 +304,7 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
         frontWave, nextWave = nextWave, frontWave
         table.clear(nextWave)
     end
+    
     return true
 end
 
@@ -291,11 +326,13 @@ end
 local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNode: PathNode): PathList?
     --If the finish node wasn't the origin, the costs can't be used for this path
     if finishNode[IDX_TOTALCOST] ~= 0 then
+        CustomWarn("Finish node at (", finishNode[IDX_POSITION], ") was not the finish used to update costs!")
         return nil
     end
 
     --If the start node wasn't visited, no path can exist
     if startNode[IDX_TOTALCOST] == math.huge then
+        CustomWarn("FindPathUsingCosts with start node (", startNode[IDX_POSITION], ") that is unreachable")
         return nil
     end
 
@@ -313,8 +350,9 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
             end
         end
 
-        --If a valid neighbor isn't found, no reason to keep searching
+        --If a valid neighbor isn't found, no reason to keep searching (should never happen)
         if (bestNeighbor == nil) then
+            CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Finish (", finishNode[IDX_POSITION], ")")
             break
         end
         --Record the neighbor
@@ -322,8 +360,9 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
     end
     local pathLen = #path
 
-    --If the path didn't connect to the finish node, a path doesn't exist
+    --If the path didn't connect to the finish node, a path doesn't exist (should never happen)
     if path[pathLen] ~= finishNode then
+        CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Finish (", finishNode[IDX_POSITION], ")")
         return nil
     end
 
@@ -356,7 +395,7 @@ function PathLib.FindPathUsingCosts(mesh: PathMesh, start: Vector3, finish: Vect
     end
 
     if finishNode[IDX_TOTALCOST] ~= 0 then
-        warn("Finish node at (", finish, ") was not the finish used to update costs!")
+        CustomWarn("Finish node at (", finish, ") was not the finish used to update costs!")
         return nil
     end
 
@@ -517,7 +556,7 @@ end
 function PathLib.IsAreaUnblocked(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): boolean
     local nodes = mesh.Nodes
 
-    min, max = AreaToGrid(min, max, includePartial)
+    min, max = AlignAreaToGrid(min, max, includePartial)
 
     for z = min.Z, max.Z, GRID_COORD_SPACING do
         local index = CoordToIndex(min.X, z)
@@ -539,6 +578,7 @@ end
 function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
     local nodePos = ToPathGridRound(point)
     local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
+
     return (node ~= nil) and not node[IDX_BLOCKED] and (node[IDX_TOTALCOST] ~= math.huge)
 end
 
