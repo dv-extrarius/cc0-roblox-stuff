@@ -55,7 +55,6 @@ end
 local function CustomError(level: number, ...: any)
     if EnableDebugMessages then
         local args = {...}
-        local msg = ""
         for i, arg in args do
             args[i] = tostring(arg)
         end
@@ -75,8 +74,11 @@ local function DeltaCoordToIndex(x: number, z: number): number
     return (x) + (z * GRID_INDEX_MUL)
 end
 
-
 --Function to snap coordinates to pathing grid by rounding
+local function ToPathGridSingleRound(coord: number): number
+    return math.round((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+end
+
 local function ToPathGridRound(coord: Vector3): Vector3
     return Vector3.new(
         math.round((coord.X - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET,
@@ -122,7 +124,7 @@ end
 PathLib.AlignAreaToGrid = AlignAreaToGrid
 
 
---Configure PathLib with the provided settings
+--Initialize PathLib with the provided settings
 function PathLib.Configure(config: {EnableDebugMessages: boolean?}): ()
     if config.EnableDebugMessages ~= nil then
         EnableDebugMessages = config.EnableDebugMessages and true or false --cast to boolean
@@ -140,7 +142,6 @@ end
 function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
     local newMesh: PathMesh = {Nodes = {}, IsFinalized = false}
     local newNodes = newMesh.Nodes
-
     for index, current in mesh.Nodes do
         local node = table.clone(current)
         node[IDX_NEIGHBORS] = table.create(4)
@@ -150,6 +151,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
     if mesh.IsFinalized and not skipFinalize then
         PathLib.FinalizeMesh(newMesh)
     end
+
     return newMesh
 end
 
@@ -304,7 +306,7 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
         frontWave, nextWave = nextWave, frontWave
         table.clear(nextWave)
     end
-    
+
     return true
 end
 
@@ -429,20 +431,21 @@ end
 
 
 --[[
-    Calculate whether a line between two nodes includes only unblocked nodes.
-    The provided coordinates must be aligned to the pathing grid (ToPathGrid*)
+    Calculate whether a line between two points includes only unblocked nodes.
+    NOTE: The points need not be aligned to the pathing grid!
     Returns false iff the line crosses any grid coordinate with no node or a node marked blocked.
     
     Based on "A Fast Voxel Traversal Algorithm for Ray Tracing" by John Amanatides and Andrew Woo
     Extended to be a kind of "circle cast" against the path grid by tracing two lines.
 --]]
-function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Radius can't exceed (or equal?) GRID_COORD_SPACING/2 or nodes might be missed
     local radius = GRID_COORD_SPACING/2 - 0.00001
     local nodes = mesh.Nodes
     local node: PathNode
 
     local delta = finish - start
+    local du = delta.Unit --cache for speed
     --How far to step along the X and Z coordinates to get the next grid coordinate
     local stepX = if delta.X > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
     local stepZ = if delta.Z > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
@@ -450,51 +453,96 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
     local offsetX = DeltaCoordToIndex(stepX, 0)
     local offsetZ = DeltaCoordToIndex(0, stepZ)
 
-    local index = CoordToIndex(start.X, start.Z)
+    --Two points opposite a circle by the normal of the line
+    local pAX = start.X + radius *  du.Z
+    local pAZ = start.Z + radius * -du.X
+    local pBX = start.X + radius * -du.Z
+    local pBZ = start.Z + radius *  du.X
+    --Those coordinates snapped to the grid
+    local pAXGrid = ToPathGridSingleRound(pAX)
+    local pAZGrid = ToPathGridSingleRound(pAZ)
+    local pBXGrid = ToPathGridSingleRound(pBX)
+    local pBZGrid = ToPathGridSingleRound(pBZ)
+
+    local index = CoordToIndex(pAXGrid, pAZGrid)
     --If the line is horizontal or vertical, special processinng is required to avoid division by zero
     if delta.X == 0 then
-        for z = start.Z, finish.Z, stepZ do
-            node = nodes[index]
-            if not node or node[IDX_BLOCKED] then
-                return false
+        --For the loop count we need to know
+        local pAEndZ = finish.Z + radius * -du.X
+        local pAEndZGrid = ToPathGridSingleRound(pAEndZ)
+        
+        if pAXGrid == pBXGrid then
+            for zz = pAZGrid, pAEndZGrid, stepZ do
+                node = nodes[index]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                index += offsetZ
             end
-            index += offsetZ
+        else
+            local indexDelta
+            if pAXGrid < pBXGrid then
+                indexDelta = DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+            else
+                indexDelta = DeltaCoordToIndex(-GRID_COORD_SPACING, 0)
+            end
+            
+            for zz = pAZGrid, pAEndZGrid, stepZ do
+                node = nodes[index]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                node = nodes[index + indexDelta]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                index += offsetZ
+            end
         end
         return true
     elseif delta.Z == 0 then
-        for x = start.X, finish.X, stepX do
-            node = nodes[index]
-            if not node or node[IDX_BLOCKED] then
-                return false
+        local pAEndX = finish.X + radius *  du.Z
+        local pAEndXGrid = ToPathGridSingleRound(pAEndX)
+        
+        if pAZGrid ~= pBZGrid then
+            for xx = pAXGrid, pAEndXGrid, stepX do
+                node = nodes[index]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                index += offsetX
             end
-            index += offsetX
+        else
+            local indexDelta
+            if pAZGrid < pBZGrid then
+                indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
+            else
+                indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
+            end
+            
+            for xx = pAXGrid, pAEndXGrid, stepX do
+                node = nodes[index]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                node = nodes[index + indexDelta]
+                if not node or node[IDX_BLOCKED] then
+                    return false
+                end
+                index += offsetX
+            end
         end
         return true
     end
+    --When to step to keep the slope correct
+    local tMaxXA = (pAXGrid + stepX/2 - pAX) / delta.X
+    local tMaxZA = (pAZGrid + stepZ/2 - pAZ) / delta.Z
+    local tMaxXB = (pBXGrid + stepX/2 - pBX) / delta.X
+    local tMaxZB = (pBZGrid + stepZ/2 - pBZ) / delta.Z
 
     --The change in T a step in each direction adavances.
     local tDeltaX = stepX / delta.X
     local tDeltaZ = stepZ / delta.Z
-
-    local du = delta.Unit --Cache the coordinate change's unit vector
-
-    --Coordinates used for two lines adjusted based on a circle 
-    --local pAX = start.X + radius *  du.Z
-    --local pAZ = start.Z + radius * -du.X
-    --local pBX = start.X + radius * -du.Z
-    --local pBZ = start.Z + radius *  du.X
-
-    --The T value for the next X and Z crossing for each of the lines
-    --local tMaxXA = (start.X + stepX/2 - pAX) / delta.X
-    --local tMaxZA = (start.Z + stepZ/2 - pAZ) / delta.Z
-    --local tMaxXB = (start.X + stepX/2 - pBX) / delta.X
-    --local tMaxZB = (start.Z + stepZ/2 - pBZ) / delta.Z
-
-    --Manually simplified expressions
-    local tMaxXA = (stepX/2 - radius *  du.Z) / delta.X
-    local tMaxZA = (stepZ/2 - radius * -du.X) / delta.Z
-    local tMaxXB = (stepX/2 - radius * -du.Z) / delta.X
-    local tMaxZB = (stepZ/2 - radius *  du.X) / delta.Z
 
     --Step line A between X and Z grid crossings, checking each node along the path
     while (tMaxXA <= 1) or (tMaxZA <= 1) do
@@ -502,7 +550,7 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
         if not node or node[IDX_BLOCKED] then
             return false
         end
-        --Advance to the nearest grid crossing, whether in X or Z direction
+        --Advance to the next nearest grid crossing, whether in X or Z direction
         if tMaxXA < tMaxZA then
             tMaxXA += tDeltaX
             index += offsetX
@@ -518,13 +566,13 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
     end
 
     --Step line B between X and Z grid crossings, checking each node along the path
-    index = CoordToIndex(start.X, start.Z)    
+    index = CoordToIndex(pBXGrid, pBZGrid)
     while (tMaxXB <= 1) or (tMaxZB <= 1) do
         node = nodes[index]
         if not node or node[IDX_BLOCKED] then
             return false
         end
-        --Advance to the nearest grid crossing, whether in X or Z direction
+        --Advance to the next nearest grid crossing, whether in X or Z direction
         if tMaxXB < tMaxZB then
             tMaxXB += tDeltaX
             index += offsetX
@@ -541,15 +589,7 @@ function IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boole
 
     return true
 end
-
---Calculate whether a line between two points includes only unblocked nodes.
-function PathLib.IsLineUnblocked(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
-    --Look up the start and finish locations in the node grid
-    local startNodePos = ToPathGridRound(start)
-    local finishNodePos = ToPathGridRound(finish)
-
-    return IsLineUnblocked(mesh, startNodePos, finishNodePos)
-end
+PathLib.IsLineTraversable = IsLineTraversable
 
 
 --Calculate whether a rectangle between two points includes only unblocked nodes.
@@ -599,7 +639,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
     while (p > 1) and (n < pathLen) do
         p -= 1
         n += 1
-        if not IsLineUnblocked(mesh, path[p], path[n]) then
+        if not IsLineTraversable(mesh, path[p], path[n]) then
             p += 1
             n -= 1
             break
@@ -616,7 +656,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
         --March next point forwards (towards finish) as far as it's unblocked
         while n < pathLen do
             n += 1
-            if not IsLineUnblocked(mesh, path[p], path[n]) then
+            if not IsLineTraversable(mesh, path[p], path[n]) then
                 n -= 1
                 break
             end
@@ -625,7 +665,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
         --March previous point backwards (towards start) as far as it's unblocked
         while p > 1 do
             p -= 1
-            if not IsLineUnblocked(mesh, path[p], path[n]) then
+            if not IsLineTraversable(mesh, path[p], path[n]) then
                 p += 1
                 break
             end
