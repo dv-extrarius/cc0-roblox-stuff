@@ -18,9 +18,10 @@ local IDX_INDEX = 3
 local IDX_RANDOMWEIGHT = 4
 local IDX_TOTALCOST = 5
 local IDX_BLOCKED = 6
+local IDX_NEXTNODE = 7
 
 type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
---{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean}
+--{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
 export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean}
 export type PathList = {Vector3}
 
@@ -39,7 +40,6 @@ per coordinate, resulting in a multiplier of 2^17 = 131072. I keep room for 3 co
 multiplier. This allows maps to span the region from -65536 to +65535
 ]]
 local GRID_INDEX_MUL = 131072 
-
 
 --Actual module-local variables
 local EnableDebugMessages: boolean = false
@@ -145,7 +145,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
     for index, current in mesh.Nodes do
         local node = table.clone(current)
         node[IDX_NEIGHBORS] = table.create(4)
-        newNodes[index ] = node
+        newNodes[index] = node
     end
 
     if mesh.IsFinalized and not skipFinalize then
@@ -173,7 +173,8 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
                     index,                      --Index
                     (math.random() / 100000.0), --RandomWeight
                     math.huge,                  --TotalCost
-                    false                       --Blocked
+                    false,                      --Blocked
+                    nil,                        --NextNode
                 }
             end
             index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
@@ -283,6 +284,7 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
     --Reset costs to maximum value
     for _, node in mesh.Nodes do
         node[IDX_TOTALCOST] = math.huge
+        node[IDX_NEXTNODE] = nil
     end
 
     --Do a full expansion of nodes in waves until all unblocked nodes have been assigned the minimum cost to get there
@@ -324,6 +326,36 @@ function PathLib.UpdateMeshCosts(mesh: PathMesh, finish: Vector3): boolean
 end
 
 
+--Find the next node towards the goal from each node in the mesh
+local function CalculateNextNodes(mesh: PathMesh, finishNode: PathNode): ()
+    if finishNode[IDX_NEXTNODE] ~= nil then
+        return
+    end
+    
+    --For each node, calculate the best neighbor for moving towards the finish node
+    for index, node in mesh.Nodes do
+        if node[IDX_BLOCKED] or (node[IDX_TOTALCOST] == math.huge) then
+            continue
+        end
+        local bestNeighbor: PathNode? = nil
+        
+        --If the node itself isn't blocked and has a cost less than math.huge, it's reachable so has at least one good neighbor
+        for _, neighbor in node[IDX_NEIGHBORS] do
+            if (bestNeighbor == nil) or (neighbor[IDX_TOTALCOST] < bestNeighbor[IDX_TOTALCOST]) then
+                bestNeighbor = neighbor
+            end
+        end
+        --
+        if (bestNeighbor == nil) or  (bestNeighbor[IDX_TOTALCOST] == math.huge) then
+            CustomError(1, "Failed to find a good neighbor for a reachable node!")
+        else
+            node[IDX_NEXTNODE] = bestNeighbor
+        end
+    end
+    finishNode[IDX_NEXTNODE] = finishNode
+end
+
+
 --Find a path between the given nodes using the already-computed costs
 local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNode: PathNode): PathList?
     --If the finish node wasn't the origin, the costs can't be used for this path
@@ -338,19 +370,16 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
         return nil
     end
 
+    CalculateNextNodes(mesh, finishNode)
+    
     --Follow the cheapest nodes from start finish
     --Note that since start has a valid TotalCost, it was visited so a path exists
     --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
     local path: {PathNode} = {startNode}
-    while path[#path] ~= finishNode do
-        local current = path[#path]
-        local bestNeighbor: PathNode? = nil
-
-        for _, neighbor in current[IDX_NEIGHBORS] do
-            if ((bestNeighbor == nil) or (neighbor[IDX_TOTALCOST] < bestNeighbor[IDX_TOTALCOST])) then
-                bestNeighbor = neighbor
-            end
-        end
+    local pathLen = 1
+    while path[pathLen] ~= finishNode do
+        local current = path[pathLen]
+        local bestNeighbor: PathNode? = current[IDX_NEXTNODE]
 
         --If a valid neighbor isn't found, no reason to keep searching (should never happen)
         if (bestNeighbor == nil) then
@@ -359,8 +388,8 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
         end
         --Record the neighbor
         table.insert(path, bestNeighbor)
+        pathLen += 1
     end
-    local pathLen = #path
 
     --If the path didn't connect to the finish node, a path doesn't exist (should never happen)
     if path[pathLen] ~= finishNode then
@@ -470,7 +499,7 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
         --For the loop count we need to know
         local pAEndZ = finish.Z + radius * -du.X
         local pAEndZGrid = ToPathGridSingleRound(pAEndZ)
-        
+
         if pAXGrid == pBXGrid then
             for zz = pAZGrid, pAEndZGrid, stepZ do
                 node = nodes[index]
@@ -486,7 +515,7 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
             else
                 indexDelta = DeltaCoordToIndex(-GRID_COORD_SPACING, 0)
             end
-            
+
             for zz = pAZGrid, pAEndZGrid, stepZ do
                 node = nodes[index]
                 if not node or node[IDX_BLOCKED] then
@@ -503,7 +532,7 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
     elseif delta.Z == 0 then
         local pAEndX = finish.X + radius *  du.Z
         local pAEndXGrid = ToPathGridSingleRound(pAEndX)
-        
+
         if pAZGrid ~= pBZGrid then
             for xx = pAXGrid, pAEndXGrid, stepX do
                 node = nodes[index]
@@ -519,7 +548,7 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
             else
                 indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
             end
-            
+
             for xx = pAXGrid, pAEndXGrid, stepX do
                 node = nodes[index]
                 if not node or node[IDX_BLOCKED] then
@@ -731,6 +760,5 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
     end
     return path
 end
-
 
 return table.freeze(PathLib)
