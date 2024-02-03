@@ -22,7 +22,7 @@ local IDX_NEXTNODE = 7
 
 type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
-export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean}
+export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean, Generator: Random}
 export type PathList = {Vector3}
 
 --Path nodes are spaced every other stud
@@ -39,7 +39,7 @@ per coordinate, resulting in a multiplier of 2^17 = 131072. I keep room for 3 co
 - for now, we only use X and Z. Since we want max negative coordinate to map to 0, we add half the
 multiplier. This allows maps to span the region from -65536 to +65535
 ]]
-local GRID_INDEX_MUL = 131072 
+local GRID_INDEX_MUL = 131072
 
 --Actual module-local variables
 local EnableDebugMessages: boolean = false
@@ -75,50 +75,45 @@ local function DeltaCoordToIndex(x: number, z: number): number
 end
 
 --Function to snap coordinates to pathing grid by rounding
-local function ToPathGridSingleRound(coord: number): number
+local function ToPathGridRoundSingle(coord: number): number
     return math.round((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
-
 local function ToPathGridRound(coord: Vector3): Vector3
-    return Vector3.new(
-        math.round((coord.X - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET,
-        0,
-        math.round((coord.Z - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
-    )
+    return Vector3.new(ToPathGridRoundSingle(coord.X), 0, ToPathGridRoundSingle(coord.Z))
 end
 PathLib.ToPathGridRound = ToPathGridRound
 
 
 --Function to snap coordinates to pathing grid by flooring
-function ToPathGridFloor(coord: Vector3): Vector3
-    return Vector3.new(
-        math.floor((coord.X - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET,
-        0,
-        math.floor((coord.Z - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
-    )
+local function ToPathGridFloorSingle(coord: number): number
+    return math.floor((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+end
+local function ToPathGridFloor(coord: Vector3): Vector3
+    return Vector3.new(ToPathGridFloorSingle(coord.X), 0, ToPathGridFloorSingle(coord.Z))
 end
 PathLib.ToPathGridFloor = ToPathGridFloor
 
 
 --Function to snap coordinates to pathing grid by ceiling
-function ToPathGridCeil(coord: Vector3): Vector3
-    return Vector3.new(
-        math.ceil((coord.X - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET,
-        0,
-        math.ceil((coord.Z - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
-    )
+local function ToPathGridCeilSingle(coord: number): number
+    return math.ceil((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+end
+local function ToPathGridCeil(coord: Vector3): Vector3
+    return Vector3.new(ToPathGridCeilSingle(coord.X), 0, ToPathGridCeilSingle(coord.Z))
 end
 PathLib.ToPathGridCeil = ToPathGridCeil
 
 
 --Function to fit an area to the grid
 local function AlignAreaToGrid(min: Vector3, max: Vector3, includePartial: boolean?): (Vector3, Vector3)
-    local high = Vector3.new(math.max(max.X, min.X), math.max(max.Y, min.Y), math.max(max.Z, min.Z))
-    local low = Vector3.new(math.min(max.X, min.X), math.min(max.Y, min.Y), math.min(max.Z, min.Z))
+    local minX = math.min(min.X, max.X)
+    local minZ = math.min(min.Z, max.Z)
+    local maxX = math.max(min.X, max.X)
+    local maxZ = math.max(min.Z, max.Z)
     if not includePartial then
-        return ToPathGridCeil(low), ToPathGridFloor(high)
+        return Vector3.new(ToPathGridCeilSingle(minX), 0, ToPathGridCeilSingle(minZ)), Vector3.new(ToPathGridFloorSingle(maxX), 0, ToPathGridFloorSingle(maxZ))
     else
-        return ToPathGridFloor(low), ToPathGridCeil(high)
+        return Vector3.new(ToPathGridFloorSingle(minX), 0, ToPathGridFloorSingle(minZ)), Vector3.new(ToPathGridCeilSingle(maxX), 0, ToPathGridCeilSingle(maxZ))
     end
 end
 PathLib.AlignAreaToGrid = AlignAreaToGrid
@@ -133,18 +128,27 @@ end
 
 
 --Create an empty mesh
-function PathLib.NewMesh(): PathMesh
-    return {Nodes = {}, IsFinalized = false}
+function PathLib.NewMesh(seed: number?): PathMesh
+    return {
+        Nodes = {},
+        IsFinalized = false,
+        Generator = if seed ~= nil then Random.new(seed) else Random.new() --Random.new(nil) fails
+    }
 end
 
 
 --Clone a mesh. Finalizes the nodes if the original is finialized
 function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
-    local newMesh: PathMesh = {Nodes = {}, IsFinalized = false}
+    local table_clone = table.clone
+    local table_create = table.create
+
+    local newMesh: PathMesh = {Nodes = {}, IsFinalized = false, Generator = mesh.Generator:Clone()}
     local newNodes = newMesh.Nodes
+
     for index, current in mesh.Nodes do
-        local node = table.clone(current)
-        node[IDX_NEIGHBORS] = table.create(4)
+        local node = table_clone(current)
+
+        node[IDX_NEIGHBORS] = table_create(4)
         newNodes[index] = node
     end
 
@@ -158,7 +162,10 @@ end
 
 --Add nodes to a mesh to cover a specified region
 function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): ()
+    local table_create = table.create
+
     local nodes = mesh.Nodes
+    local gen = mesh.Generator
 
     min, max = AlignAreaToGrid(min, max, includePartial)
 
@@ -166,15 +173,15 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
         local index = CoordToIndex(min.X, z)
 
         for x = min.X, max.X, GRID_COORD_SPACING do
-            if nodes[index] == nil then 
+            if nodes[index] == nil then
                 nodes[index] = {
-                    table.create(4),            --Neighbors
-                    Vector3.new(x, 0, z),       --Position 
-                    index,                      --Index
-                    (math.random() / 100000.0), --RandomWeight
-                    math.huge,                  --TotalCost
-                    false,                      --Blocked
-                    nil,                        --NextNode
+                    table_create(4),               --Neighbors
+                    Vector3.new(x, 0, z),          --Position
+                    index,                         --Index
+                    (gen:NextNumber() / 100000.0), --RandomWeight
+                    math.huge,                     --TotalCost
+                    false,                         --Blocked
+                    nil,                           --NextNode
                 }
             end
             index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
@@ -185,36 +192,40 @@ end
 
 --Do final processing on each node in the mesh
 function PathLib.FinalizeMesh(mesh: PathMesh): ()
+    local table_freeze = table.freeze
+
     local nodes = mesh.Nodes
     local neighbor: PathNode?
 
     --Connect each node to 4-way neighbors if they exist
     for index, current in nodes do
+        local neighbors: {PathNode} = current[IDX_NEIGHBORS]
+
         neighbor = nodes[index + DeltaCoordToIndex(-GRID_COORD_SPACING, 0)]
         if neighbor ~= nil then
-            table.insert(current[IDX_NEIGHBORS], neighbor)
+            table.insert(neighbors, neighbor)
         end
 
         neighbor = nodes[index + DeltaCoordToIndex( GRID_COORD_SPACING, 0)]
         if neighbor ~= nil then
-            table.insert(current[IDX_NEIGHBORS], neighbor)
+            table.insert(neighbors, neighbor)
         end
 
         neighbor = nodes[index + DeltaCoordToIndex(0, -GRID_COORD_SPACING)]
         if neighbor ~= nil then
-            table.insert(current[IDX_NEIGHBORS], neighbor)
+            table.insert(neighbors, neighbor)
         end
 
         neighbor = nodes[index + DeltaCoordToIndex(0,  GRID_COORD_SPACING)]
         if neighbor ~= nil then
-            table.insert(current[IDX_NEIGHBORS], neighbor)
+            table.insert(neighbors, neighbor)
         end
 
-        table.freeze(current[IDX_NEIGHBORS])
+        table_freeze(current[IDX_NEIGHBORS])
     end
 
     mesh.IsFinalized = true
-    table.freeze(mesh.Nodes)
+    table_freeze(mesh.Nodes)
 end
 
 
@@ -275,6 +286,8 @@ end
 
 --Update the costs so paths can be found from anywhere to finishNode
 local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
+    local table_clear = table.clear
+
     --Finding a path requires a finalized mesh
     if not mesh.IsFinalized then
         CustomError(1, "Attempted UpdateMeshCosts without finalizing the mesh.")
@@ -306,7 +319,7 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
             end
         end
         frontWave, nextWave = nextWave, frontWave
-        table.clear(nextWave)
+        table_clear(nextWave)
     end
 
     return true
@@ -331,18 +344,21 @@ local function CalculateNextNodes(mesh: PathMesh, finishNode: PathNode): ()
     if finishNode[IDX_NEXTNODE] ~= nil then
         return
     end
-    
+
     --For each node, calculate the best neighbor for moving towards the finish node
     for index, node in mesh.Nodes do
         if node[IDX_BLOCKED] or (node[IDX_TOTALCOST] == math.huge) then
             continue
         end
         local bestNeighbor: PathNode? = nil
-        
-        --If the node itself isn't blocked and has a cost less than math.huge, it's reachable so has at least one good neighbor
+        local bestCost = math.huge
+
+        --If the node itself isn't blocked and was visited, it's reachable so has at least one good neighbor
         for _, neighbor in node[IDX_NEIGHBORS] do
-            if (bestNeighbor == nil) or (neighbor[IDX_TOTALCOST] < bestNeighbor[IDX_TOTALCOST]) then
+            local neighborCost: number = neighbor[IDX_TOTALCOST]
+            if neighborCost < bestCost then
                 bestNeighbor = neighbor
+                bestCost = neighborCost
             end
         end
         --
@@ -371,7 +387,7 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
     end
 
     CalculateNextNodes(mesh, finishNode)
-    
+
     --Follow the cheapest nodes from start finish
     --Note that since start has a valid TotalCost, it was visited so a path exists
     --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
@@ -387,8 +403,8 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
             break
         end
         --Record the neighbor
-        table.insert(path, bestNeighbor)
         pathLen += 1
+        path[pathLen] = bestNeighbor
     end
 
     --If the path didn't connect to the finish node, a path doesn't exist (should never happen)
@@ -463,11 +479,11 @@ end
     Calculate whether a line between two points includes only unblocked nodes.
     NOTE: The points need not be aligned to the pathing grid!
     Returns false iff the line crosses any grid coordinate with no node or a node marked blocked.
-    
+
     Based on "A Fast Voxel Traversal Algorithm for Ray Tracing" by John Amanatides and Andrew Woo
     Extended to be a kind of "circle cast" against the path grid by tracing two lines.
 --]]
-function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+local function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Radius can't exceed (or equal?) GRID_COORD_SPACING/2 or nodes might be missed
     local radius = GRID_COORD_SPACING/2 - 0.00001
     local nodes = mesh.Nodes
@@ -488,17 +504,17 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
     local pBX = start.X + radius * -du.Z
     local pBZ = start.Z + radius *  du.X
     --Those coordinates snapped to the grid
-    local pAXGrid = ToPathGridSingleRound(pAX)
-    local pAZGrid = ToPathGridSingleRound(pAZ)
-    local pBXGrid = ToPathGridSingleRound(pBX)
-    local pBZGrid = ToPathGridSingleRound(pBZ)
+    local pAXGrid = ToPathGridRoundSingle(pAX)
+    local pAZGrid = ToPathGridRoundSingle(pAZ)
+    local pBXGrid = ToPathGridRoundSingle(pBX)
+    local pBZGrid = ToPathGridRoundSingle(pBZ)
 
     local index = CoordToIndex(pAXGrid, pAZGrid)
     --If the line is horizontal or vertical, special processinng is required to avoid division by zero
     if delta.X == 0 then
         --For the loop count we need to know
         local pAEndZ = finish.Z + radius * -du.X
-        local pAEndZGrid = ToPathGridSingleRound(pAEndZ)
+        local pAEndZGrid = ToPathGridRoundSingle(pAEndZ)
 
         if pAXGrid == pBXGrid then
             for zz = pAZGrid, pAEndZGrid, stepZ do
@@ -531,7 +547,7 @@ function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boo
         return true
     elseif delta.Z == 0 then
         local pAEndX = finish.X + radius *  du.Z
-        local pAEndXGrid = ToPathGridSingleRound(pAEndX)
+        local pAEndXGrid = ToPathGridRoundSingle(pAEndX)
 
         if pAZGrid ~= pBZGrid then
             for xx = pAXGrid, pAEndXGrid, stepX do
@@ -658,7 +674,7 @@ local function DeleteArrayRange<T>(t: {T}, minIndex: number, maxIndex: number): 
 end
 
 
---Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes 
+--Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes
 local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: number): (number, number)
     local pathLen = #path
     local p = cornerIndex
@@ -760,5 +776,6 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
     end
     return path
 end
+
 
 return table.freeze(PathLib)
