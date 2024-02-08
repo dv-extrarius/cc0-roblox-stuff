@@ -22,7 +22,7 @@ local IDX_NEXTNODE = 7
 
 type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
-export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean, Generator: Random}
+export type PathMesh = {Nodes: {[number]: PathNode}, IsFinalized: boolean, Generator: Random, GoalNodes: {PathNode}}
 export type PathList = {Vector3}
 
 --Path nodes are spaced every other stud
@@ -51,6 +51,7 @@ local function CustomWarn(...: any)
         warn(...)
     end
 end
+
 --Variadic error that also checks EnableDebugMessages
 local function CustomError(level: number, ...: any)
     if EnableDebugMessages then
@@ -73,6 +74,7 @@ end
 local function DeltaCoordToIndex(x: number, z: number): number
     return (x) + (z * GRID_INDEX_MUL)
 end
+
 
 --Function to snap coordinates to pathing grid by rounding
 local function ToPathGridRoundSingle(coord: number): number
@@ -132,7 +134,8 @@ function PathLib.NewMesh(seed: number?): PathMesh
     return {
         Nodes = {},
         IsFinalized = false,
-        Generator = if seed ~= nil then Random.new(seed) else Random.new() --Random.new(nil) fails
+        Generator = if seed ~= nil then Random.new(seed) else Random.new(), --Random.new(nil) fails
+        GoalNodes = {}
     }
 end
 
@@ -142,7 +145,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
     local table_clone = table.clone
     local table_create = table.create
 
-    local newMesh: PathMesh = {Nodes = {}, IsFinalized = false, Generator = mesh.Generator:Clone()}
+    local newMesh: PathMesh = {Nodes = {}, IsFinalized = false, Generator = mesh.Generator:Clone(), GoalNodes = table.clone(mesh.GoalNodes)}
     local newNodes = newMesh.Nodes
 
     for index, current in mesh.Nodes do
@@ -284,8 +287,8 @@ local function ValidateNode(label: string, location: Vector3, node: PathNode): b
 end
 
 
---Update the costs so paths can be found from anywhere to finishNode
-local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
+--Update the costs so paths can be found from anywhere to any goal
+local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
     local table_clear = table.clear
 
     --Finding a path requires a finalized mesh
@@ -300,12 +303,16 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
         node[IDX_NEXTNODE] = nil
     end
 
+    mesh.GoalNodes = table.clone(goalNodes)
+
     --Do a full expansion of nodes in waves until all unblocked nodes have been assigned the minimum cost to get there
     local frontWave: {[number]: PathNode} = {}
     local nextWave: {[number]: PathNode} = {}
 
-    frontWave[finishNode[IDX_INDEX]] = finishNode
-    finishNode[IDX_TOTALCOST] = 0
+    for _, goalNode in goalNodes do
+        frontWave[goalNode[IDX_INDEX]] = goalNode
+        goalNode[IDX_TOTALCOST] = 0
+    end
 
     while next(frontWave) ~= nil do
         for index, current in frontWave do
@@ -326,34 +333,44 @@ local function UpdateMeshCosts(mesh: PathMesh, finishNode: PathNode): boolean
 end
 
 
---Update the costs so paths can be found from anywhere to finish
-function PathLib.UpdateMeshCosts(mesh: PathMesh, finish: Vector3): boolean
-    local finishNodePos = ToPathGridRound(finish)
-    local finishNode = mesh.Nodes[CoordToIndex(finishNodePos.X, finishNodePos.Z)]
+--Update the costs so paths can be found from anywhere to any of the goals
+function PathLib.UpdateMeshCosts(mesh: PathMesh, goals: {Vector3}): boolean
+    local goalNodes: {PathNode} = table.create(#goals)
+    for ii, goal in goals do
+        local goalNodePos = ToPathGridRound(goal)
+        local goalNode = mesh.Nodes[CoordToIndex(goalNodePos.X, goalNodePos.Z)]
 
-    if not ValidateNode("Finish", finish, finishNode) then
-        return false
+        if not ValidateNode("Goal", goal, goalNode) then
+            return false
+        end
+        goalNodes[ii] = goalNode
     end
 
-    return UpdateMeshCosts(mesh, finishNode)
+    return UpdateMeshCosts(mesh, goalNodes)
 end
 
 
---Find the next node towards the goal from each node in the mesh
-local function CalculateNextNodes(mesh: PathMesh, finishNode: PathNode): ()
-    if finishNode[IDX_NEXTNODE] ~= nil then
-        return
+--Find the next node towards the goals from each node in the mesh
+local function CalculateNextNodes(mesh: PathMesh): boolean
+    if mesh.GoalNodes[1] == nil then
+        return false
+    end
+    --If the goal node(s) already point somewhere, we already did this
+    if mesh.GoalNodes[1][IDX_NEXTNODE] ~= nil then
+        return true
     end
 
     --For each node, calculate the best neighbor for moving towards the finish node
     for index, node in mesh.Nodes do
-        if node[IDX_BLOCKED] or (node[IDX_TOTALCOST] == math.huge) then
+        --Ignore blocked, unreachable, and goal nodes
+        local nodeCost = node[IDX_TOTALCOST]
+        if node[IDX_BLOCKED] or (nodeCost == math.huge) or (nodeCost == 0) then
             continue
         end
         local bestNeighbor: PathNode? = nil
         local bestCost = math.huge
 
-        --If the node itself isn't blocked and was visited, it's reachable so has at least one good neighbor
+        --If the node isn't blocked and was visited, it's reachable so has at least one good neighbor
         for _, neighbor in node[IDX_NEIGHBORS] do
             local neighborCost: number = neighbor[IDX_TOTALCOST]
             if neighborCost < bestCost then
@@ -364,19 +381,24 @@ local function CalculateNextNodes(mesh: PathMesh, finishNode: PathNode): ()
         --
         if (bestNeighbor == nil) or  (bestNeighbor[IDX_TOTALCOST] == math.huge) then
             CustomError(1, "Failed to find a good neighbor for a reachable node!")
+            return false
         else
             node[IDX_NEXTNODE] = bestNeighbor
         end
     end
-    finishNode[IDX_NEXTNODE] = finishNode
+    --Goal nodes point to themselves for simplicity
+    for _, goalNode in mesh.GoalNodes do
+        goalNode[IDX_NEXTNODE] = goalNode
+    end
+    return true
 end
 
 
---Find a path between the given nodes using the already-computed costs
-local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNode: PathNode): PathList?
-    --If the finish node wasn't the origin, the costs can't be used for this path
-    if finishNode[IDX_TOTALCOST] ~= 0 then
-        CustomWarn("Finish node at (", finishNode[IDX_POSITION], ") was not the finish used to update costs!")
+--Find a path from the given start node to any goal node using the already-computed costs
+local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList?
+    --Goal nodes are required to calculate the next nodes
+    if mesh.GoalNodes[1] == nil then
+        CustomError(1, "Attempt to find path before setting goal nodes with UpdateMeshCosts!")
         return nil
     end
 
@@ -386,14 +408,17 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
         return nil
     end
 
-    CalculateNextNodes(mesh, finishNode)
+    --If the next nodes can't be calculated
+    if not CalculateNextNodes(mesh) then
+        return nil
+    end
 
     --Follow the cheapest nodes from start finish
     --Note that since start has a valid TotalCost, it was visited so a path exists
     --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
     local path: {PathNode} = {startNode}
     local pathLen = 1
-    while path[pathLen] ~= finishNode do
+    while path[pathLen][IDX_TOTALCOST] ~= 0 do
         local current = path[pathLen]
         local bestNeighbor: PathNode? = current[IDX_NEXTNODE]
 
@@ -405,12 +430,6 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode, finishNod
         --Record the neighbor
         pathLen += 1
         path[pathLen] = bestNeighbor
-    end
-
-    --If the path didn't connect to the finish node, a path doesn't exist (should never happen)
-    if path[pathLen] ~= finishNode then
-        CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Finish (", finishNode[IDX_POSITION], ")")
-        return nil
     end
 
     --Store the position of each node used in the correct (reversed, so start to finish) order
@@ -425,55 +444,18 @@ end
 
 
 --Find a path between the given locations using the already-computed costs
-function PathLib.FindPathUsingCosts(mesh: PathMesh, start: Vector3, finish: Vector3): PathList?
+function PathLib.FindPathUsingCosts(mesh: PathMesh, start: Vector3): PathList?
     --Look up the start and finish locations in the node grid
     local startNodePos = ToPathGridRound(start)
-    local finishNodePos = ToPathGridRound(finish)
 
     local startNode = mesh.Nodes[CoordToIndex(startNodePos.X, startNodePos.Z)]
-    local finishNode = mesh.Nodes[CoordToIndex(finishNodePos.X, finishNodePos.Z)]
 
     if not ValidateNode("Start", start, startNode) then
         return nil
     end
 
-    if not ValidateNode("Finish", finish, finishNode) then
-        return nil
-    end
-
-    if finishNode[IDX_TOTALCOST] ~= 0 then
-        CustomWarn("Finish node at (", finish, ") was not the finish used to update costs!")
-        return nil
-    end
-
-    return FindPathUsingCosts(mesh, startNode, finishNode)
+    return FindPathUsingCosts(mesh, startNode)
 end
-
-
---Find a path between the given locations using the path mesh. Updates costs
-function PathLib.FindPath(mesh: PathMesh, start: Vector3, finish: Vector3): PathList?
-    --Look up the start and finish locations in the node grid
-    local startNodePos = ToPathGridRound(start)
-    local finishNodePos = ToPathGridRound(finish)
-
-    local startNode = mesh.Nodes[CoordToIndex(startNodePos.X, startNodePos.Z)]
-    local finishNode = mesh.Nodes[CoordToIndex(finishNodePos.X, finishNodePos.Z)]
-
-    if not ValidateNode("Start", start, startNode) then
-        return nil
-    end
-
-    if not ValidateNode("Finish", finish, finishNode) then
-        return nil
-    end
-
-    if not UpdateMeshCosts(mesh, finishNode) then
-        return nil
-    end
-
-    return FindPathUsingCosts(mesh, startNode, finishNode)
-end
-
 
 --[[
     Calculate whether a line between two points includes only unblocked nodes.
@@ -549,7 +531,7 @@ local function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3
         local pAEndX = finish.X + radius *  du.Z
         local pAEndXGrid = ToPathGridRoundSingle(pAEndX)
 
-        if pAZGrid ~= pBZGrid then
+        if pAZGrid == pBZGrid then
             for xx = pAXGrid, pAEndXGrid, stepX do
                 node = nodes[index]
                 if not node or node[IDX_BLOCKED] then
@@ -562,7 +544,7 @@ local function IsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3
             if pAZGrid < pBZGrid then
                 indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
             else
-                indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
+                indexDelta = DeltaCoordToIndex(0, -GRID_COORD_SPACING)
             end
 
             for xx = pAXGrid, pAEndXGrid, stepX do
