@@ -85,7 +85,7 @@ end
 
 --Function to snap coordinates to pathing grid by rounding
 local function ToPathGridRoundSingle(coord: number): number
-    return math.round((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+    return math.round((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
 local function ToPathGridRound(coord: Vector3): Vector3
     return Vector3.new(ToPathGridRoundSingle(coord.X), 0, ToPathGridRoundSingle(coord.Z))
@@ -95,7 +95,7 @@ PathLib.ToPathGridRound = ToPathGridRound
 
 --Function to snap coordinates to pathing grid by flooring
 local function ToPathGridFloorSingle(coord: number): number
-    return math.floor((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+    return math.floor((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
 local function ToPathGridFloor(coord: Vector3): Vector3
     return Vector3.new(ToPathGridFloorSingle(coord.X), 0, ToPathGridFloorSingle(coord.Z))
@@ -105,7 +105,7 @@ PathLib.ToPathGridFloor = ToPathGridFloor
 
 --Function to snap coordinates to pathing grid by ceiling
 local function ToPathGridCeilSingle(coord: number): number
-    return math.ceil((coord - GRID_COORD_OFFSET) / GRID_COORD_SPACING) * GRID_COORD_SPACING + GRID_COORD_OFFSET
+    return math.ceil((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
 local function ToPathGridCeil(coord: Vector3): Vector3
     return Vector3.new(ToPathGridCeilSingle(coord.X), 0, ToPathGridCeilSingle(coord.Z))
@@ -125,10 +125,14 @@ PathLib.IsOnPathGrid = IsOnPathGrid
 
 --Function to fit an area to the grid
 local function AlignAreaToGrid(min: Vector3, max: Vector3, includePartial: boolean?): (Vector3, Vector3)
-    local minX = math.min(min.X, max.X)
-    local minZ = math.min(min.Z, max.Z)
-    local maxX = math.max(min.X, max.X)
-    local maxZ = math.max(min.Z, max.Z)
+    local x0 = min.X
+    local x1 = max.X
+    local z0 = min.Z
+    local z1 = max.Z
+    local minX = math.min(x0, x1)
+    local minZ = math.min(z0, z1)
+    local maxX = math.max(x0, x1)
+    local maxZ = math.max(z0, z1)
     if not includePartial then
         return Vector3.new(ToPathGridCeilSingle(minX), 0, ToPathGridCeilSingle(minZ)), Vector3.new(ToPathGridFloorSingle(maxX), 0, ToPathGridFloorSingle(maxZ))
     else
@@ -456,8 +460,12 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList
 
         --If a valid neighbor isn't found, no reason to keep searching (should never happen)
         if (bestNeighbor == nil) then
-            CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Finish (", finishNode[IDX_POSITION], ")")
-            break
+            local goals = {}
+            for _, node in mesh.GoalNodes do
+                table.insert(goals, "(" .. tostring(node[IDX_POSITION]) .. ")")
+            end
+            CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Goals {", table.concat(goals, ", "), "}")
+            return nil
         end
         --Record the neighbor
         pathLen += 1
@@ -499,25 +507,29 @@ end
     Extended to be a kind of "circle cast" against the path grid by tracing two lines.
 --]]
 local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
-    --Radius can't exceed (or equal?) GRID_COORD_SPACING/2 or nodes might be missed
+    --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or nodes might be missed
     local radius = GRID_COORD_SPACING/2 - 0.00001
     local nodes = mesh.Nodes
     local node: PathNode
 
     local delta = finish - start
+    local deltaX = delta.X
+    local deltaZ = delta.Z
     local du = delta.Unit --cache for speed
     --How far to step along the X and Z coordinates to get the next grid coordinate
-    local stepX = if delta.X > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
-    local stepZ = if delta.Z > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
+    local stepX = if deltaX > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
+    local stepZ = if deltaZ > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
     --How to adjust the index to get to the cell in the corresponding direction
     local offsetX = DeltaCoordToIndex(stepX, 0)
     local offsetZ = DeltaCoordToIndex(0, stepZ)
 
     --Two points opposite a circle by the normal of the line
-    local pAX = start.X + radius *  du.Z
-    local pAZ = start.Z + radius * -du.X
-    local pBX = start.X + radius * -du.Z
-    local pBZ = start.Z + radius *  du.X
+    local rduX = radius * du.X
+    local rduZ = radius * du.Z
+    local pAX = start.X + rduZ --Yes, the X has the delta-unit Z added because it's perpendicular to the line
+    local pAZ = start.Z - rduX --And vice versa, perpendicular to (X, Z) is (Z, -X)
+    local pBX = start.X - rduZ --And the other perpendicular vector to (X, Z) is (-Z, X)
+    local pBZ = start.Z + rduX
     --Those coordinates snapped to the grid
     local pAXGrid = ToPathGridRoundSingle(pAX)
     local pAZGrid = ToPathGridRoundSingle(pAZ)
@@ -526,9 +538,9 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
 
     local index = CoordToIndex(pAXGrid, pAZGrid)
     --If the line is horizontal or vertical, special processinng is required to avoid division by zero
-    if delta.X == 0 then
+    if deltaX == 0 then
         --For the loop count we need to know
-        local pAEndZ = finish.Z + radius * -du.X
+        local pAEndZ = finish.Z - rduX
         local pAEndZGrid = ToPathGridRoundSingle(pAEndZ)
 
         if pAXGrid == pBXGrid then
@@ -560,8 +572,8 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
             end
         end
         return true
-    elseif delta.Z == 0 then
-        local pAEndX = finish.X + radius *  du.Z
+    elseif deltaZ == 0 then
+        local pAEndX = finish.X + rduZ
         local pAEndXGrid = ToPathGridRoundSingle(pAEndX)
 
         if pAZGrid == pBZGrid then
@@ -594,15 +606,15 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
         end
         return true
     end
-    --When to step to keep the slope correct
-    local tMaxXA = (pAXGrid + stepX/2 - pAX) / delta.X
-    local tMaxZA = (pAZGrid + stepZ/2 - pAZ) / delta.Z
-    local tMaxXB = (pBXGrid + stepX/2 - pBX) / delta.X
-    local tMaxZB = (pBZGrid + stepZ/2 - pBZ) / delta.Z
+    --The T values at which a grid crossing takes place
+    local tMaxXA = (pAXGrid + stepX*0.5 - pAX) / deltaX
+    local tMaxZA = (pAZGrid + stepZ*0.5 - pAZ) / deltaZ
+    local tMaxXB = (pBXGrid + stepX*0.5 - pBX) / deltaX
+    local tMaxZB = (pBZGrid + stepZ*0.5 - pBZ) / deltaZ
 
     --The change in T a step in each direction adavances.
-    local tDeltaX = stepX / delta.X
-    local tDeltaZ = stepZ / delta.Z
+    local tDeltaX = stepX / deltaX
+    local tDeltaZ = stepZ / deltaZ
 
     --Step line A between X and Z grid crossings, checking each node along the path
     while (tMaxXA <= 1) or (tMaxZA <= 1) do
@@ -649,7 +661,6 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
 
     return true
 end
-
 
 --Wrapper of IsLineTraversable that uses a cache for grid-aligned queries
 local function CachedIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
