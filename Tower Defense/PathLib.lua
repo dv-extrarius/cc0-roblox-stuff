@@ -28,6 +28,7 @@ export type PathMesh = {
     Generator: Random,
     GoalNodes: {PathNode},
     LineCache: {[number]: {[number]: boolean}},
+    SimplifyCache: {[Vector3]: Vector3},
 }
 export type PathList = {Vector3}
 
@@ -158,6 +159,7 @@ function PathLib.NewMesh(seed: number?): PathMesh
         Generator = if seed ~= nil then Random.new(seed) else Random.new(), --Random.new(nil) fails
         GoalNodes = {},
         LineCache = {},
+        SimplifyCache = {},
     }
 end
 
@@ -173,6 +175,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
         Generator = mesh.Generator:Clone(),
         GoalNodes = table.clone(mesh.GoalNodes),
         LineCache = {},
+        SimplifyCache = {},
     }
     local newNodes = newMesh.Nodes
 
@@ -282,6 +285,8 @@ function PathLib.BlockNodes(mesh: PathMesh, min: Vector3, max: Vector3, includeP
     for _, cache in mesh.LineCache do
         table.clear(cache)
     end
+    --Clear the cache for path simplification since it's now invalid
+    table.clear(mesh.SimplifyCache)
 end
 
 
@@ -307,6 +312,8 @@ function PathLib.UnblockNodes(mesh: PathMesh, min: Vector3, max: Vector3, includ
     for _, cache in mesh.LineCache do
         table.clear(cache)
     end
+    --Clear the cache for path simplification since it's now invalid
+    table.clear(mesh.SimplifyCache)
 end
 
 
@@ -537,12 +544,14 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
     local pBZGrid = ToPathGridRoundSingle(pBZ)
 
     local index = CoordToIndex(pAXGrid, pAZGrid)
+
     --If the line is horizontal or vertical, special processinng is required to avoid division by zero
     if deltaX == 0 then
-        --For the loop count we need to know
+        --For the loop count the Z endpoint is needed
         local pAEndZ = finish.Z - rduX
         local pAEndZGrid = ToPathGridRoundSingle(pAEndZ)
 
+        --If the two lines representing the circle are in the same cell, only check one cell along the way
         if pAXGrid == pBXGrid then
             for zz = pAZGrid, pAEndZGrid, stepZ do
                 node = nodes[index]
@@ -552,6 +561,7 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
                 index += offsetZ
             end
         else
+            --Otherwise, check one cell for each line
             local indexDelta
             if pAXGrid < pBXGrid then
                 indexDelta = DeltaCoordToIndex(GRID_COORD_SPACING, 0)
@@ -573,9 +583,11 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
         end
         return true
     elseif deltaZ == 0 then
+        --For the loop count the X endpoint is needed
         local pAEndX = finish.X + rduZ
         local pAEndXGrid = ToPathGridRoundSingle(pAEndX)
 
+        --If the two lines representing the circle are in the same cell, only check one cell along the way
         if pAZGrid == pBZGrid then
             for xx = pAXGrid, pAEndXGrid, stepX do
                 node = nodes[index]
@@ -585,6 +597,7 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
                 index += offsetX
             end
         else
+            --Otherwise, check one cell for each line
             local indexDelta
             if pAZGrid < pBZGrid then
                 indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
@@ -662,6 +675,7 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
     return true
 end
 
+
 --Wrapper of IsLineTraversable that uses a cache for grid-aligned queries
 local function CachedIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     if not IsOnPathGrid(start) or not IsOnPathGrid(finish) then
@@ -738,12 +752,6 @@ function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
 end
 
 
---Delete a range of elements from an array
-local function DeleteArrayRange<T>(t: {T}, minIndex: number, maxIndex: number): ()
-    table.move(t, maxIndex+1, #t+(maxIndex-minIndex+1), minIndex)
-end
-
-
 --Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes
 local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: number, minStart: number): (number, number)
     local pathLen = #path
@@ -817,7 +825,29 @@ local function SimplifyCopyNodes(path: PathList, first: number, last: number, si
         end
         i = n
     end
-    table.insert(simplified, path[last])
+    if last >= first then
+        table.insert(simplified, path[last])
+    end
+end
+
+
+--Eliminate nodes that can be bypassed with straight-line movement
+local function SimplifyPass2(mesh: PathMesh, path: PathList): PathList
+    local pathLen = #path
+    local simplePath = {}
+    local i = 1
+    while i < pathLen do
+        local currNode = path[i]
+        table.insert(simplePath, currNode)
+        local j = i+2
+        while (j <= pathLen) and CachedIsLineTraversable(mesh, currNode, path[j]) do
+            j += 1
+        end
+        j -= 1
+        i = j
+    end
+    table.insert(simplePath, path[i])
+    return simplePath
 end
 
 
@@ -825,16 +855,26 @@ end
 Simplify the path by using straight lines to skip nodes where possible.
 The resulting path may not closely follow the original path, but only traverses unblocked nodes.
 --]]
-function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
-    --Remove corner nodes that can be bypassed by straight line movement
+function PathLib.SimplifyPath(mesh: PathMesh, path: PathList): PathList
+    --Remove corner nodes that can be bypassed by diagonal straight line movement
     --These corners are typically in open space and just a limitation of 4-direction movement
     --Also reduce runs of nodes in a line to just the nodes on the ends
+    local simplifyCache = mesh.SimplifyCache
     local i = 2
     local simplePath = {}
     local lastFixedNode = 1
+    local useCache = false
 
     while i < #path do
         local currNode = path[i]
+
+        --If this node is in the cache, the rest of the simplified path is known
+        if simplifyCache[currNode] then
+            --Copy nodes up to this point to the simplified path
+            SimplifyCopyNodes(path, lastFixedNode, i, simplePath)
+            useCache = true
+            break
+        end
 
         --Adjecent nodes match in X or Z. If how 3 consecutive nodes match differs, it's a corner
         if (path[i-1].X == currNode.X) ~= (currNode.X == path[i+1].X) then
@@ -843,16 +883,54 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList)
             if (p+1 < n) then
                 SimplifyCopyNodes(path, lastFixedNode, p, simplePath)
                 lastFixedNode = n
-                i = n
+                i = n - 1 --i gets incremented below, so we continue at i=n
             end
         end
-
         i += 1
     end
-    SimplifyCopyNodes(path, lastFixedNode, #path, simplePath)
-    return simplePath
-end
 
+    --Copy remaining nodes on the path if the cache doesn't complete the path
+    if not useCache then
+        SimplifyCopyNodes(path, lastFixedNode, #path, simplePath)
+    end
+
+    --Put the path so far into the cache (before the rest is copied from the cache)
+    local prevNode = simplePath[1]
+    local simplePathLen = #simplePath
+    i = 2
+    while i <= simplePathLen do
+        local currNode = simplePath[i]
+        simplifyCache[prevNode] = currNode
+        prevNode = currNode
+        i += 1
+    end
+
+    --If the next point is in the cache, load the rest from the cache
+    if useCache then
+        local nextNode = simplifyCache[simplePath[simplePathLen]]
+        while nextNode do
+            simplePathLen += 1
+            simplePath[simplePathLen] = nextNode
+            nextNode = simplifyCache[nextNode]
+        end
+    end
+
+    --Perform a second simplification pass that reduces the number of nodes in many cases
+    local extraSimplePath = SimplifyPass2(mesh, simplePath)
+    if #extraSimplePath < #simplePath then
+        --If the second pass improved the simplification, update the cache
+        local extrasSimplePathLen = #extraSimplePath
+        prevNode = extraSimplePath[1]
+        i = 2
+        while i <= extrasSimplePathLen do
+            local currNode = extraSimplePath[i]
+            simplifyCache[prevNode] = currNode
+            prevNode = currNode
+            i += 1
+        end
+    end
+    return extraSimplePath
+end
 
 
 return table.freeze(PathLib)
