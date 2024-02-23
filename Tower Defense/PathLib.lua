@@ -1,5 +1,5 @@
 --[[
-Copyright Extrarius 2023.
+Copyright Extrarius 2023, 2024
 This work is marked with CC0 1.0 Universal.
 To view a copy of this license, visit http://creativecommons.org/publicdomain/zero/1.0
 --
@@ -15,17 +15,17 @@ local PathLib = {}
 local IDX_NEIGHBORS = 1
 local IDX_POSITION = 2
 local IDX_INDEX = 3
-local IDX_RANDOMWEIGHT = 4
-local IDX_TOTALCOST = 5
-local IDX_BLOCKED = 6
-local IDX_NEXTNODE = 7
+local IDX_TOTALCOST = 4
+local IDX_BLOCKED = 5
+local IDX_NEXTNODE = 6
 
 type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
---{Neighbors: {PathNode}, Position: Vector3, Index: number, RandomWeight: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
+--{Neighbors: {PathNode}, Position: Vector3, Index: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
 export type PathMesh = {
     Nodes: {[number]: PathNode},
+    NodeIndexes: {number},
     IsFinalized: boolean,
-    Generator: Random,
+    Generator: Random, --TODO: Seeded randomness is broken for cloned meshes
     GoalNodes: {PathNode},
     LineCache: {[number]: {[number]: boolean}},
     SimplifyCache: {[Vector3]: Vector3},
@@ -155,6 +155,7 @@ end
 function PathLib.NewMesh(seed: number?): PathMesh
     return {
         Nodes = {},
+        NodeIndexes = {},
         IsFinalized = false,
         Generator = if seed ~= nil then Random.new(seed) else Random.new(), --Random.new(nil) fails
         GoalNodes = {},
@@ -171,6 +172,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
 
     local newMesh: PathMesh = {
         Nodes = {},
+        NodeIndexes = {},
         IsFinalized = false,
         Generator = mesh.Generator:Clone(),
         GoalNodes = table.clone(mesh.GoalNodes),
@@ -199,7 +201,6 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
     local table_create = table.create
 
     local nodes = mesh.Nodes
-    local gen = mesh.Generator
 
     min, max = AlignAreaToGrid(min, max, includePartial)
 
@@ -212,7 +213,6 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
                     table_create(4),               --Neighbors
                     Vector3.new(x, 0, z),          --Position
                     index,                         --Index
-                    (gen:NextNumber() / 100000.0), --RandomWeight
                     math.huge,                     --TotalCost
                     false,                         --Blocked
                     nil,                           --NextNode
@@ -228,7 +228,9 @@ end
 function PathLib.FinalizeMesh(mesh: PathMesh): ()
     local table_freeze = table.freeze
 
+    local nodeIndexes = mesh.NodeIndexes
     local nodes = mesh.Nodes
+    local gen = mesh.Generator
     local neighbor: PathNode?
 
     --Connect each node to 4-way neighbors if they exist
@@ -255,11 +257,16 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
             table.insert(neighbors, neighbor)
         end
 
-        table_freeze(current[IDX_NEIGHBORS])
+        gen:Shuffle(neighbors)
+        table_freeze(neighbors)
+
+        table.insert(nodeIndexes, index)
     end
+    table.sort(nodeIndexes)
 
     mesh.IsFinalized = true
-    table_freeze(mesh.Nodes)
+    table_freeze(nodes)
+    table_freeze(nodeIndexes)
 end
 
 
@@ -317,6 +324,78 @@ function PathLib.UnblockNodes(mesh: PathMesh, min: Vector3, max: Vector3, includ
 end
 
 
+--Save the current blocked state of every node in the mesh to a buffer
+local function SaveBlockedStates(mesh: PathMesh): buffer
+    local nodes = mesh.Nodes
+    local indexes = mesh.NodeIndexes
+
+    local bitmap = buffer.create(4 * ((#indexes + 31) // 32))
+
+    --Pack the state bits into a number
+    local value = 0
+    local bits = 0
+    local offset = 0
+
+    for _, index in indexes do
+        value *= 2
+        if nodes[index][IDX_BLOCKED] then
+            value += 1
+        end
+
+        --Flush the accumulated bits to the buffer when there are enough
+        bits += 1
+        if bits == 32 then
+            buffer.writeu32(bitmap, offset, value)
+            value = 0
+            bits = 0
+            offset += 4
+        end
+    end
+
+    --If any bits haven't been flushed to the buffer, do so now
+    if bits > 0 then
+        value = bit32.lshift(value, 32 - bits)
+        buffer.writeu32(bitmap, offset, value)
+    end
+
+    return bitmap
+end
+PathLib.SaveBlockedStates = SaveBlockedStates
+
+
+--Restore the blocked state of every node in the mesh from a buffer
+local function RestoreBlockedStates(mesh: PathMesh, bitmap: buffer)
+    local nodes = mesh.Nodes
+    local indexes = mesh.NodeIndexes
+
+    --Unpack the states from the buffer
+    local value = 0
+    local bits = 0
+    local offset = 0
+
+    for _, index in indexes do
+        --If no unpacked bits are left, retrieve more from the buffer
+        if bits == 0 then
+            value = buffer.readu32(bitmap, offset)
+            bits = 32
+            offset += 4
+        end
+
+        --The high bit matches the blocked state
+        if value >= 0x80000000 then
+            value -= 0x80000000
+            nodes[index][IDX_BLOCKED] = true
+        else
+            nodes[index][IDX_BLOCKED] = false
+        end
+
+        value *= 2
+        bits -= 1
+    end
+end
+PathLib.RestoreBlockedStates = RestoreBlockedStates
+
+
 --Utility to print warnings for invalid start/finish locations
 local function ValidateNode(label: string, location: Vector3, node: PathNode): boolean
     if node == nil then
@@ -355,11 +434,13 @@ local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
     for _, goalNode in goalNodes do
         frontWave[goalNode[IDX_INDEX]] = goalNode
         goalNode[IDX_TOTALCOST] = 0
+        --Goal nodes point to themselves for simplicity
+        goalNode[IDX_NEXTNODE] = goalNode
     end
 
     while next(frontWave) ~= nil do
         for index, current in frontWave do
-            local TotalCost = current[IDX_TOTALCOST] + 1 + current[IDX_RANDOMWEIGHT]
+            local TotalCost = current[IDX_TOTALCOST] + 1
 
             for _, neighbor in current[IDX_NEIGHBORS] do
                 if (not neighbor[IDX_BLOCKED]) and (TotalCost < neighbor[IDX_TOTALCOST]) then
@@ -393,50 +474,6 @@ function PathLib.UpdateMeshCosts(mesh: PathMesh, goals: {Vector3}): boolean
 end
 
 
---Find the next node towards the goals from each node in the mesh
-local function CalculateNextNodes(mesh: PathMesh): boolean
-    if mesh.GoalNodes[1] == nil then
-        return false
-    end
-    --If the goal node(s) already point somewhere, we already did this
-    if mesh.GoalNodes[1][IDX_NEXTNODE] ~= nil then
-        return true
-    end
-
-    --For each node, calculate the best neighbor for moving towards the finish node
-    for index, node in mesh.Nodes do
-        --Ignore blocked, unreachable, and goal nodes
-        local nodeCost = node[IDX_TOTALCOST]
-        if node[IDX_BLOCKED] or (nodeCost == math.huge) or (nodeCost == 0) then
-            continue
-        end
-        local bestNeighbor: PathNode? = nil
-        local bestCost = math.huge
-
-        --If the node isn't blocked and was visited, it's reachable so has at least one good neighbor
-        for _, neighbor in node[IDX_NEIGHBORS] do
-            local neighborCost: number = neighbor[IDX_TOTALCOST]
-            if neighborCost < bestCost then
-                bestNeighbor = neighbor
-                bestCost = neighborCost
-            end
-        end
-        --
-        if (bestNeighbor == nil) or  (bestNeighbor[IDX_TOTALCOST] == math.huge) then
-            CustomError(1, "Failed to find a good neighbor for a reachable node!")
-            return false
-        else
-            node[IDX_NEXTNODE] = bestNeighbor
-        end
-    end
-    --Goal nodes point to themselves for simplicity
-    for _, goalNode in mesh.GoalNodes do
-        goalNode[IDX_NEXTNODE] = goalNode
-    end
-    return true
-end
-
-
 --Find a path from the given start node to any goal node using the already-computed costs
 local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList?
     --Goal nodes are required to calculate the next nodes
@@ -451,11 +488,6 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList
         return nil
     end
 
-    --If the next nodes can't be calculated
-    if not CalculateNextNodes(mesh) then
-        return nil
-    end
-
     --Follow the cheapest nodes from start finish
     --Note that since start has a valid TotalCost, it was visited so a path exists
     --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
@@ -465,6 +497,19 @@ local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList
         local current = path[pathLen]
         local bestNeighbor: PathNode? = current[IDX_NEXTNODE]
 
+        if (bestNeighbor == nil) then
+            local bestCost = math.huge
+
+            --If the node isn't blocked and was visited, it's reachable so has at least one good neighbor
+            for _, neighbor in current[IDX_NEIGHBORS] do
+                local neighborCost: number = neighbor[IDX_TOTALCOST]
+                if neighborCost < bestCost then
+                    bestNeighbor = neighbor
+                    bestCost = neighborCost
+                end
+            end
+            current[IDX_NEXTNODE] = bestNeighbor
+        end
         --If a valid neighbor isn't found, no reason to keep searching (should never happen)
         if (bestNeighbor == nil) then
             local goals = {}
@@ -729,20 +774,6 @@ function PathLib.IsAreaUnblocked(mesh: PathMesh, min: Vector3, max: Vector3, inc
 end
 
 
---Calcuate whether the remainder of a path is still traversable
-function PathLib.IsPathRemainderTraversable(mesh: PathMesh, path: PathList, startNode: number): boolean
-    local prevNode = path[startNode]
-    for ii = startNode + 1, #path do
-        local node = path[ii]
-        if not CachedIsLineTraversable(mesh, prevNode, node) then
-            return false
-        end
-        prevNode = node
-    end
-    return true
-end
-
-
 --Calculate whether a point is reachable from any goal point used to calculate costs
 function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
     local nodePos = ToPathGridRound(point)
@@ -773,32 +804,29 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
         return cornerIndex, cornerIndex
     end
 
-    --If the previous loop changed p and n, so the corner node can be eliminated
+    --The previous loop changed p and n, so the corner node can be eliminated
     --check whether even more nodes can be eliminated in either direction
-    if p ~= n then
-        --March next point forwards (towards finish) as far as it's unblocked
-        while n < pathLen do
-            n += 1
-            if not CachedIsLineTraversable(mesh, path[p], path[n]) then
-                n -= 1
-                break
-            end
-        end
 
-        --March previous point backwards (towards start) as far as it's unblocked
-        while p > minStart do
-            p -= 1
-            if not CachedIsLineTraversable(mesh, path[p], path[n]) then
-                p += 1
-                break
-            end
+    --March next point forwards (towards finish) as far as it's unblocked
+    while n < pathLen do
+        n += 1
+        if not CachedIsLineTraversable(mesh, path[p], path[n]) then
+            n -= 1
+            break
         end
-
-        --Return the two nodes that must be kept - everything between them can be eliminated
-        return p, n
     end
-    --The corner couldn't be eliminated,
-    return cornerIndex, cornerIndex
+
+    --March previous point backwards (towards start) as far as it's unblocked
+    while p > minStart do
+        p -= 1
+        if not CachedIsLineTraversable(mesh, path[p], path[n]) then
+            p += 1
+            break
+        end
+    end
+
+    --Return the two nodes that must be kept - everything between them can be eliminated
+    return p, n
 end
 
 
