@@ -23,12 +23,14 @@ type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in 
 --{Neighbors: {PathNode}, Position: Vector3, Index: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?}
 export type PathMesh = {
     Nodes: {[number]: PathNode},
-    NodeIndexes: {number},
+    SortedNodes: {PathNode},
     IsFinalized: boolean,
-    Generator: Random, --TODO: Seeded randomness is broken for cloned meshes
+    FinalizeSeed: number,
     GoalNodes: {PathNode},
     LineCache: {[number]: {[number]: boolean}},
     SimplifyCache: {[Vector3]: Vector3},
+    FrontWaveTable: {[number]: PathNode},
+    NextWaveTable: {[number]: PathNode},
 }
 export type PathList = {Vector3}
 
@@ -155,41 +157,64 @@ end
 function PathLib.NewMesh(seed: number?): PathMesh
     return {
         Nodes = {},
-        NodeIndexes = {},
+        SortedNodes = {},
         IsFinalized = false,
-        Generator = if seed ~= nil then Random.new(seed) else Random.new(), --Random.new(nil) fails
+        FinalizeSeed = seed or os.time(),
         GoalNodes = {},
         LineCache = {},
         SimplifyCache = {},
+        FrontWaveTable = {},
+        NextWaveTable = {},
     }
 end
 
 
 --Clone a mesh. Finalizes the nodes if the original is finialized
 function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
-    local table_clone = table.clone
-    local table_create = table.create
-
     local newMesh: PathMesh = {
         Nodes = {},
-        NodeIndexes = {},
+        SortedNodes = table.create(#mesh.SortedNodes),
         IsFinalized = false,
-        Generator = mesh.Generator:Clone(),
+        FinalizeSeed = mesh.FinalizeSeed,
         GoalNodes = table.clone(mesh.GoalNodes),
         LineCache = {},
         SimplifyCache = {},
+        FrontWaveTable = {},
+        NextWaveTable = {},
     }
+    local oldNodes = mesh.Nodes
+    local oldSorted = mesh.SortedNodes
     local newNodes = newMesh.Nodes
+    local newSorted = newMesh.SortedNodes
 
-    for index, current in mesh.Nodes do
-        local node = table_clone(current)
+    for index, oldNode in oldNodes do
+        local newNode = table.clone(oldNode)
 
-        node[IDX_NEIGHBORS] = table_create(4)
-        newNodes[index] = node
+        newNode[IDX_NEIGHBORS] = table.create(4)
+        newNode[IDX_NEXTNODE] = nil
+        newNodes[index] = newNode
+    end
+    --Copy sorted nodes from sorted nodes, so the new one is sorted if the old one is
+    for _, oldNode in oldSorted do
+        table.insert(newSorted, newNodes[oldNode[IDX_INDEX]])
     end
 
     if mesh.IsFinalized and not skipFinalize then
-        PathLib.FinalizeMesh(newMesh)
+        --Connect each node to its 4-way neighbors
+        for index, current in newNodes do
+            local neighbors: {PathNode} = current[IDX_NEIGHBORS]
+            local oldNeighbors: {PathNode} = oldNodes[index][IDX_NEIGHBORS]
+
+            for i, neighbor in oldNeighbors do
+                neighbors[i] = newNodes[neighbor[IDX_INDEX]]
+            end
+            --The post-shuffled order was copied
+            table.freeze(neighbors)
+        end
+
+        mesh.IsFinalized = true
+        table.freeze(newNodes)
+        table.freeze(newSorted)
     end
 
     return newMesh
@@ -198,9 +223,8 @@ end
 
 --Add nodes to a mesh to cover a specified region
 function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePartial: boolean?): ()
-    local table_create = table.create
-
     local nodes = mesh.Nodes
+    local sorted = mesh.SortedNodes
 
     min, max = AlignAreaToGrid(min, max, includePartial)
 
@@ -209,14 +233,16 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
 
         for x = min.X, max.X, GRID_COORD_SPACING do
             if nodes[index] == nil then
-                nodes[index] = {
-                    table_create(4),               --Neighbors
+                local node: PathNode = {
+                    table.create(4),               --Neighbors
                     Vector3.new(x, 0, z),          --Position
                     index,                         --Index
                     math.huge,                     --TotalCost
                     false,                         --Blocked
                     nil,                           --NextNode
                 }
+                nodes[index] = node
+                table.insert(sorted, node)
             end
             index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
         end
@@ -224,14 +250,26 @@ function PathLib.AddNodes(mesh: PathMesh, min: Vector3, max: Vector3, includePar
 end
 
 
+--Fisher-Yates fair shuffle
+local function shuffle<T>(arr: {T}): {T}
+    local arrLen = #arr
+    for i = 1, arrLen-1 do
+        local j = math.random(i, arrLen)
+        arr[i], arr[j] = arr[j], arr[i]
+    end
+    return arr
+end
+
+
 --Do final processing on each node in the mesh
 function PathLib.FinalizeMesh(mesh: PathMesh): ()
-    local table_freeze = table.freeze
-
-    local nodeIndexes = mesh.NodeIndexes
     local nodes = mesh.Nodes
-    local gen = mesh.Generator
+    local sorted = mesh.SortedNodes
+    local seed = mesh.FinalizeSeed
     local neighbor: PathNode?
+
+    --Make the sorted nodes actually sorted (by index)
+    table.sort(sorted, function (lhs, rhs) return lhs[IDX_INDEX] < rhs[IDX_INDEX] end)
 
     --Connect each node to 4-way neighbors if they exist
     for index, current in nodes do
@@ -257,16 +295,15 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
             table.insert(neighbors, neighbor)
         end
 
-        gen:Shuffle(neighbors)
-        table_freeze(neighbors)
+        math.randomseed(seed + index)
+        shuffle(neighbors)
 
-        table.insert(nodeIndexes, index)
+        table.freeze(neighbors)
     end
-    table.sort(nodeIndexes)
 
     mesh.IsFinalized = true
-    table_freeze(nodes)
-    table_freeze(nodeIndexes)
+    table.freeze(nodes)
+    table.freeze(sorted)
 end
 
 
@@ -326,19 +363,17 @@ end
 
 --Save the current blocked state of every node in the mesh to a buffer
 local function SaveBlockedStates(mesh: PathMesh): buffer
-    local nodes = mesh.Nodes
-    local indexes = mesh.NodeIndexes
-
-    local bitmap = buffer.create(4 * ((#indexes + 31) // 32))
+    local sorted = mesh.SortedNodes
+    local bitmap = buffer.create(4 * ((#sorted + 31) // 32))
 
     --Pack the state bits into a number
     local value = 0
     local bits = 0
     local offset = 0
 
-    for _, index in indexes do
+    for _, node in sorted do
         value *= 2
-        if nodes[index][IDX_BLOCKED] then
+        if node[IDX_BLOCKED] then
             value += 1
         end
 
@@ -365,15 +400,14 @@ PathLib.SaveBlockedStates = SaveBlockedStates
 
 --Restore the blocked state of every node in the mesh from a buffer
 local function RestoreBlockedStates(mesh: PathMesh, bitmap: buffer)
-    local nodes = mesh.Nodes
-    local indexes = mesh.NodeIndexes
+    local sorted = mesh.SortedNodes
 
     --Unpack the states from the buffer
     local value = 0
     local bits = 0
     local offset = 0
 
-    for _, index in indexes do
+    for _, node in sorted do
         --If no unpacked bits are left, retrieve more from the buffer
         if bits == 0 then
             value = buffer.readu32(bitmap, offset)
@@ -384,9 +418,9 @@ local function RestoreBlockedStates(mesh: PathMesh, bitmap: buffer)
         --The high bit matches the blocked state
         if value >= 0x80000000 then
             value -= 0x80000000
-            nodes[index][IDX_BLOCKED] = true
+            node[IDX_BLOCKED] = true
         else
-            nodes[index][IDX_BLOCKED] = false
+            node[IDX_BLOCKED] = false
         end
 
         value *= 2
@@ -411,8 +445,6 @@ end
 
 --Update the costs so paths can be found from anywhere to any goal
 local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
-    local table_clear = table.clear
-
     --Finding a path requires a finalized mesh
     if not mesh.IsFinalized then
         CustomError(1, "Attempted UpdateMeshCosts without finalizing the mesh.")
@@ -428,8 +460,8 @@ local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
     mesh.GoalNodes = table.clone(goalNodes)
 
     --Do a full expansion of nodes in waves until all unblocked nodes have been assigned the minimum cost to get there
-    local frontWave: {[number]: PathNode} = {}
-    local nextWave: {[number]: PathNode} = {}
+    local frontWave: {[number]: PathNode} = mesh.FrontWaveTable
+    local nextWave: {[number]: PathNode} = mesh.NextWaveTable
 
     for _, goalNode in goalNodes do
         frontWave[goalNode[IDX_INDEX]] = goalNode
@@ -450,7 +482,7 @@ local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
             end
         end
         frontWave, nextWave = nextWave, frontWave
-        table_clear(nextWave)
+        table.clear(nextWave)
     end
 
     return true
@@ -719,6 +751,7 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
 
     return true
 end
+PathLib.UncachedIsLineTraversable = RawIsLineTraversable
 
 
 --Wrapper of IsLineTraversable that uses a cache for grid-aligned queries
