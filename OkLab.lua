@@ -1,10 +1,25 @@
 --[[
-Code to convert between SRGB and OKLAB color space.
-Based on code by Björn Ottosson that he placed in the public domain.
-
 Copyright Extrarius 2024.
 This work is marked with CC0 1.0 Universal.
 To view a copy of this license, visit http://creativecommons.org/publicdomain/zero/1.0
+--
+Functions to convert between SRGB, OkLab, and OkLCH color spaces.
+Based on code by Björn Ottosson that he placed in the public domain.
+See https://bottosson.github.io/posts/oklab/ for details of OkLAb
+--
+To produce RGB colors that don't clamp too badly, the Lab/LCH components should only use part of the range.
+The following limits were determined experimentally and aren't perfect, but you'll get better results.
+
+Lab range suggestion:
+L:  0.0000 to 1.0000
+a: -0.2339 to 0.2763
+b: -0.3116 to 0.1986
+
+LCH range suggestion:
+L: 0 to 1.0000
+C: 0 to 0.3225
+H: 0 to 360 (or -180 to 180 if you prefer)
+
 --]]
 --!strict
 --!optimize 2
@@ -36,9 +51,9 @@ local function RobloxToLab(color: Color3): Vector3
     local g = ToLinear(color.G)
     local b = ToLinear(color.B)
 
-    local l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b;
-    local m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b;
-    local s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b;
+    local l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
+    local m = 0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b
+    local s = 0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b
 
     local lRoot = l ^ (1.0/3.0)
     local mRoot = m ^ (1.0/3.0)
@@ -59,9 +74,9 @@ local function LabToRoblox(color: Vector3, fullRange: boolean?): Color3
     local a = color.Y
     local b = color.Z
 
-    local lRoot = L + 0.3963377774 * a + 0.2158037573 * b;
-    local mRoot = L - 0.1055613458 * a - 0.0638541728 * b;
-    local sRoot = L - 0.0894841775 * a - 1.2914855480 * b;
+    local lRoot = L + 0.3963377774 * a + 0.2158037573 * b
+    local mRoot = L - 0.1055613458 * a - 0.0638541728 * b
+    local sRoot = L - 0.0894841775 * a - 1.2914855480 * b
 
     local l = lRoot^3
     local m = mRoot^3
