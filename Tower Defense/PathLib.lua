@@ -35,9 +35,11 @@ export type PathMesh = {
 export type PathList = {Vector3}
 
 --Path nodes are spaced every other stud
-local GRID_COORD_SPACING = 2
---Path nodes are on odd-numbered studs
-local GRID_COORD_OFFSET = 1
+local GRID_COORD_SPACING = 6
+PathLib.GRID_COORD_SPACING = GRID_COORD_SPACING
+--Path nodes are centerd in each grid square
+local GRID_COORD_OFFSET = 3
+PathLib.GRID_COORD_OFFSET = GRID_COORD_OFFSET
 
 --[[
 Before I knew Vector3 were value types, I made my own position-to-key system. After discovering
@@ -170,20 +172,21 @@ end
 
 
 --Clone a mesh. Finalizes the nodes if the original is finialized
-function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
+function PathLib.Clone(oldMesh: PathMesh, skipFinalize: boolean?): PathMesh
+
     local newMesh: PathMesh = {
         Nodes = {},
-        SortedNodes = table.create(#mesh.SortedNodes),
+        SortedNodes = table.create(#oldMesh.SortedNodes),
         IsFinalized = false,
-        FinalizeSeed = mesh.FinalizeSeed,
-        GoalNodes = table.clone(mesh.GoalNodes),
+        FinalizeSeed = oldMesh.FinalizeSeed,
+        GoalNodes = {},
         LineCache = {},
         SimplifyCache = {},
         FrontWaveTable = {},
         NextWaveTable = {},
     }
-    local oldNodes = mesh.Nodes
-    local oldSorted = mesh.SortedNodes
+    local oldNodes = oldMesh.Nodes
+    local oldSorted = oldMesh.SortedNodes
     local newNodes = newMesh.Nodes
     local newSorted = newMesh.SortedNodes
 
@@ -194,12 +197,15 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
         newNode[IDX_NEXTNODE] = nil
         newNodes[index] = newNode
     end
+    for _, oldGoal in oldMesh.GoalNodes do
+        table.insert(newMesh.GoalNodes, newNodes[oldGoal[IDX_INDEX]])
+    end
     --Copy sorted nodes from sorted nodes, so the new one is sorted if the old one is
     for _, oldNode in oldSorted do
         table.insert(newSorted, newNodes[oldNode[IDX_INDEX]])
     end
 
-    if mesh.IsFinalized and not skipFinalize then
+    if oldMesh.IsFinalized and not skipFinalize then
         --Connect each node to its 4-way neighbors
         for index, current in newNodes do
             local neighbors: {PathNode} = current[IDX_NEIGHBORS]
@@ -212,7 +218,7 @@ function PathLib.Clone(mesh: PathMesh, skipFinalize: boolean?): PathMesh
             table.freeze(neighbors)
         end
 
-        mesh.IsFinalized = true
+        newMesh.IsFinalized = true
         table.freeze(newNodes)
         table.freeze(newSorted)
     end
@@ -813,6 +819,15 @@ function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
     local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
 
     return (node ~= nil) and not node[IDX_BLOCKED] and (node[IDX_TOTALCOST] ~= math.huge)
+end
+
+
+--Calculate whether a point has an obstacle covering it
+function PathLib.IsPointBlocked(mesh: PathMesh, point: Vector3): boolean
+    local nodePos = ToPathGridRound(point)
+    local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
+
+    return (node ~= nil) and not node[IDX_BLOCKED]
 end
 
 
