@@ -136,15 +136,19 @@ function DebugHelp.MakeLabel(center: Vector3, text: any, params: {[string]: any}
 end
 
 
---
-local function Sum(arr: {number}): number
-    local total = 0
-    for _, v in arr do
-        total += v
+--Sums a sequence in a way that reduces precision loss when values differ in magnitude
+local function KahanSum(values: {number}): number
+    local sum = 0
+    local compensator = 0
+    for _, value in values do
+        local y = value - compensator
+        local t = sum + y
+        compensator = (t - sum) - y
+        sum = t
     end
-    return total
+    return sum
 end
-DebugHelp.Sum = Sum
+DebugHelp.Sum = KahanSum
 
 
 --
@@ -156,13 +160,14 @@ function DebugHelp.HistogramString(values: {number}): string
     local count = #values
     local range = (count - 1)
 
-    local digitIndex = 1
+    --Getting the number magnitude from the middle seems to give the best results
+    local digitIndex = range // 2 + 1
     while digitIndex < count and values[digitIndex] == 0 do
-        digitIndex += 1
+        digitIndex = count - ((count - digitIndex) // 2)
     end
 
     if values[digitIndex] == 0 then
-        return string.format("[%5d](   0.000); [Total =  0.0000000]", count)
+        return string.format("[%5d](    0.000); [Total =    0.0000000000]", count)
     end
 
     local numDigits = (math.log10(values[digitIndex]) // 3) * 3
@@ -199,7 +204,7 @@ function DebugHelp.HistogramString(values: {number}): string
     if suffix ~= "" then
         suffixExplanation = string.format("[%s=10^%d]", suffix, numDigits)
     end
-    return string.format("[%5d](%s)%s; [Total = %#10.7f]", count, table.concat(histogram, ", "), suffixExplanation, Sum(values))
+    return string.format("[%5d](%s)%s; [Total = %#15.10f]", count, table.concat(histogram, ", "), suffixExplanation, KahanSum(values))
 end
 
 
