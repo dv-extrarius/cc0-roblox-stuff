@@ -165,7 +165,7 @@ function DebugHelp.HistogramString(values: {number}): string
         return string.format("[%5d](   0.000); [Total =  0.0000000]", count)
     end
 
-    local numDigits = math.round(math.log10(values[digitIndex]) / 3) * 3
+    local numDigits = (math.log10(values[digitIndex]) // 3) * 3
     numDigits = math.clamp(numDigits, -12, 12)
 
     local suffix = ""
