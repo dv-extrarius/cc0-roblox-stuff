@@ -604,7 +604,7 @@ end
     Based on "A Fast Voxel Traversal Algorithm for Ray Tracing" by John Amanatides and Andrew Woo
     Extended to be a kind of "circle cast" against the path grid by tracing two lines.
 --]]
-local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or nodes might be missed
     local radius = GRID_COORD_SPACING/2 - 0.00001
     local nodes = mesh.Nodes
@@ -773,13 +773,13 @@ local function RawIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vect
 
     return true
 end
-PathLib.UncachedIsLineTraversable = RawIsLineTraversable
+PathLib.IsLineTraversableUncached = IsLineTraversableUncached
 
 
 --Wrapper of IsLineTraversable that uses a cache for grid-aligned queries
-local function CachedIsLineTraversable(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+local function IsLineTraversableCached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     if not IsOnPathGrid(start) or not IsOnPathGrid(finish) then
-        return RawIsLineTraversable(mesh, start, finish)
+        return IsLineTraversableUncached(mesh, start, finish)
     end
 
     local lowIndex = CoordToIndex(start.X, start.Z)
@@ -800,11 +800,11 @@ local function CachedIsLineTraversable(mesh: PathMesh, start: Vector3, finish: V
         return value
     end
 
-    value = RawIsLineTraversable(mesh, start, finish)
+    value = IsLineTraversableUncached(mesh, start, finish)
     cache[highIndex] = value
     return value
 end
-PathLib.IsLineTraversable = CachedIsLineTraversable
+PathLib.IsLineTraversable = IsLineTraversableCached
 
 
 --Calculate whether a rectangle between two points includes only unblocked nodes.
@@ -865,7 +865,7 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
         n += 1
         pPosition = path[p]
         nPosition = path[n]
-        if not CachedIsLineTraversable(mesh, pPosition, nPosition) then
+        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
             p += 1
             n -= 1
             break
@@ -882,22 +882,24 @@ local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: nu
     --check whether even more nodes can be eliminated in either direction
 
     --March next point forwards (towards finish) as far as it's unblocked
-    while n < pathLen do
-        n += 1
-        nPosition = path[n]
-        if not CachedIsLineTraversable(mesh, pPosition, nPosition) then
-            n -= 1
+    local startN = n
+    n = pathLen
+    for i = startN + 1, pathLen do
+        nPosition = path[i]
+        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
+            n = i - 1
             nPosition = path[n]
             break
         end
     end
 
-    --March previous point backwards (towards start) as far as it's unblocked
-    while p > minStart do
-        p -= 1
-        pPosition = path[p]
-        if not CachedIsLineTraversable(mesh, pPosition, nPosition) then
-            p += 1
+    ----March previous point backwards (towards start) as far as it's unblocked
+    local startP = p
+    p = minStart
+    for i = startP - 1, minStart, -1 do
+        pPosition = path[i]
+        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
+            p = i - 1
             --pPosition = path[p]
             break
         end
@@ -950,9 +952,9 @@ local function SimplifyPass2(mesh: PathMesh, path: PathList): PathList
         local currNode = path[i]
         table.insert(extraSimplePath, currNode)
 
-        --Trace as far ahead as possible starting from
+        --Trace as far ahead as can be reached in a straight line
         local j = i + 2
-        while (j <= pathLen) and CachedIsLineTraversable(mesh, currNode, path[j]) do
+        while (j <= pathLen) and IsLineTraversableCached(mesh, currNode, path[j]) do
             j += 1
         end
         j -= 1
