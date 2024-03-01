@@ -72,7 +72,7 @@ local function CustomError(level: number, ...: any)
         for i, arg in args do
             args[i] = tostring(arg)
         end
-        error(table.concat(args, ""), level + 1)
+        error(table.concat(args, " "), level + 1)
     end
 end
 
@@ -315,6 +315,7 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
     table.freeze(sorted)
 end
 
+
 --Mark all nodes in the specified region as blocked
 function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
@@ -411,8 +412,17 @@ PathLib.SaveBlockedStates = SaveBlockedStates
 
 
 --Restore the blocked state of every node in the mesh from a buffer
-local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState)
+local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState): boolean
     local sorted = mesh.SortedNodes
+    local requiredLength = 4 * ((#sorted + 31) // 32)
+    local stateLength = buffer.len(state)
+
+    if stateLength ~= requiredLength then
+        CustomWarn("Expected state length of ", requiredLength, ", but received state length is ", stateLength)
+        if stateLength < requiredLength then
+            return false
+        end
+    end
 
     --Unpack the states from the buffer
     local value = 0
@@ -438,6 +448,7 @@ local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState)
         value *= 2
         bits -= 1
     end
+    return true
 end
 PathLib.RestoreBlockedStates = RestoreBlockedStates
 
