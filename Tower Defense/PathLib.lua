@@ -33,6 +33,7 @@ export type PathMesh = {
     NextWaveTable: {[number]: PathNode},
 }
 export type PathList = {Vector3}
+export type MeshBlockedState = buffer
 
 --Path nodes are spaced every other stud
 local GRID_COORD_SPACING = 6
@@ -78,7 +79,7 @@ end
 
 --Convert a coordinate to a node index
 local function CoordToIndex(x: number, z: number): number
-    return (x + (GRID_INDEX_MUL/2)) + ((z + (GRID_INDEX_MUL/2)) * GRID_INDEX_MUL)
+    return (x + (GRID_INDEX_MUL / 2)) + ((z + (GRID_INDEX_MUL / 2)) * GRID_INDEX_MUL)
 end
 
 
@@ -179,7 +180,7 @@ function PathLib.Clone(oldMesh: PathMesh, skipFinalize: boolean?): PathMesh
         SortedNodes = table.create(#oldMesh.SortedNodes),
         IsFinalized = false,
         FinalizeSeed = oldMesh.FinalizeSeed,
-        GoalNodes = {},
+        GoalNodes = table.create(#oldMesh.GoalNodes),
         LineCache = {},
         SimplifyCache = {},
         FrontWaveTable = {},
@@ -214,7 +215,7 @@ function PathLib.Clone(oldMesh: PathMesh, skipFinalize: boolean?): PathMesh
             for i, neighbor in oldNeighbors do
                 newNeighbors[i] = newNodes[neighbor[IDX_INDEX]]
             end
-            --The post-shuffled order was copied
+            --The post-shuffled order was copied, don't reshuffle
             table.freeze(newNeighbors)
         end
 
@@ -261,7 +262,7 @@ end
 --Fisher-Yates fair shuffle
 local function shuffle<T>(arr: {T}): {T}
     local arrLen = #arr
-    for i = 1, arrLen-1 do
+    for i = 1, arrLen - 1 do
         local j = math.random(i, arrLen)
         arr[i], arr[j] = arr[j], arr[i]
     end
@@ -314,9 +315,8 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
     table.freeze(sorted)
 end
 
-
 --Mark all nodes in the specified region as blocked
-function PathLib.BlockNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
+function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
@@ -345,7 +345,7 @@ end
 
 
 --Mark all nodes in the specified region as unblocked
-function PathLib.UnblockNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
+function PathLib.UnblockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
     local nodes = mesh.Nodes
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
@@ -374,9 +374,9 @@ end
 
 
 --Save the current blocked state of every node in the mesh to a buffer
-local function SaveBlockedStates(mesh: PathMesh): buffer
+local function SaveBlockedStates(mesh: PathMesh): MeshBlockedState
     local sorted = mesh.SortedNodes
-    local bitmap = buffer.create(4 * ((#sorted + 31) // 32))
+    local state = buffer.create(4 * ((#sorted + 31) // 32))
 
     --Pack the state bits into a number
     local value = 0
@@ -392,26 +392,26 @@ local function SaveBlockedStates(mesh: PathMesh): buffer
         --Flush the accumulated bits to the buffer when there are enough
         bits += 1
         if bits == 32 then
-            buffer.writeu32(bitmap, offset, value)
+            buffer.writeu32(state, offset, value)
             value = 0
             bits = 0
             offset += 4
         end
     end
 
-    --If any bits haven't been flushed to the buffer, do so now
+    --Flush any bits still in the buffer
     if bits > 0 then
         value = bit32.lshift(value, 32 - bits)
-        buffer.writeu32(bitmap, offset, value)
+        buffer.writeu32(state, offset, value)
     end
 
-    return bitmap
+    return state
 end
 PathLib.SaveBlockedStates = SaveBlockedStates
 
 
 --Restore the blocked state of every node in the mesh from a buffer
-local function RestoreBlockedStates(mesh: PathMesh, bitmap: buffer)
+local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState)
     local sorted = mesh.SortedNodes
 
     --Unpack the states from the buffer
@@ -422,7 +422,7 @@ local function RestoreBlockedStates(mesh: PathMesh, bitmap: buffer)
     for _, node in sorted do
         --If no unpacked bits are left, retrieve more from the buffer
         if bits == 0 then
-            value = buffer.readu32(bitmap, offset)
+            value = buffer.readu32(state, offset)
             bits = 32
             offset += 4
         end
@@ -504,14 +504,14 @@ end
 --Update the costs so paths can be found from anywhere to any of the goals
 function PathLib.UpdateMeshCosts(mesh: PathMesh, goals: {Vector3}): boolean
     local goalNodes: {PathNode} = table.create(#goals)
-    for ii, goal in goals do
+    for i, goal in goals do
         local goalNodePos = ToPathGridRound(goal)
         local goalNode = mesh.Nodes[CoordToIndex(goalNodePos.X, goalNodePos.Z)]
 
         if not ValidateNode("Goal", goal, goalNode) then
             return false
         end
-        goalNodes[ii] = goalNode
+        goalNodes[i] = goalNode
     end
 
     return UpdateMeshCosts(mesh, goalNodes)
@@ -606,7 +606,7 @@ end
 --]]
 local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or nodes might be missed
-    local radius = GRID_COORD_SPACING/2 - 0.00001
+    local radius = GRID_COORD_SPACING / 2 - 0.00001
     local nodes = mesh.Nodes
     local node: PathNode
 
@@ -717,10 +717,10 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     end
 
     --The T values at which a grid crossing takes place
-    local tMaxXA = (pAXGrid + stepX*0.5 - pAX) / deltaX
-    local tMaxZA = (pAZGrid + stepZ*0.5 - pAZ) / deltaZ
-    local tMaxXB = (pBXGrid + stepX*0.5 - pBX) / deltaX
-    local tMaxZB = (pBZGrid + stepZ*0.5 - pBZ) / deltaZ
+    local tMaxXA = (pAXGrid + (stepX * 0.5) - pAX) / deltaX
+    local tMaxZA = (pAZGrid + (stepZ * 0.5) - pAZ) / deltaZ
+    local tMaxXB = (pBXGrid + (stepX * 0.5) - pBX) / deltaX
+    local tMaxZB = (pBZGrid + (stepZ * 0.5) - pBZ) / deltaZ
 
     --The change in T a step in each direction adavances.
     local tDeltaX = stepX / deltaX
@@ -799,7 +799,6 @@ local function IsLineTraversableCached(mesh: PathMesh, start: Vector3, finish: V
     if value then
         return value
     end
-
     value = IsLineTraversableUncached(mesh, start, finish)
     cache[highIndex] = value
     return value
@@ -847,66 +846,66 @@ function PathLib.IsPointBlocked(mesh: PathMesh, point: Vector3): boolean
     local nodePos = ToPathGridRound(point)
     local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
 
-    return node and not node[IDX_BLOCKED]
+    return node and node[IDX_BLOCKED]
 end
 
 
 --Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes
 local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: number, minStart: number): (number, number)
     local pathLen = #path
-    local p = cornerIndex
-    local n = cornerIndex
-    local pPosition
-    local nPosition
+    local prevIndex = cornerIndex
+    local nextIndex = cornerIndex
+    local prevPosition
+    local nextPosition
 
     --March both directions (towards start and finish of path) simultaneously as far as it's unblocked
-    while (p > minStart) and (n < pathLen) do
-        p -= 1
-        n += 1
-        pPosition = path[p]
-        nPosition = path[n]
-        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
-            p += 1
-            n -= 1
+    while (prevIndex > minStart) and (nextIndex < pathLen) do
+        prevIndex -= 1
+        nextIndex += 1
+        prevPosition = path[prevIndex]
+        nextPosition = path[nextIndex]
+        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
+            prevIndex += 1
+            nextIndex -= 1
             break
         end
     end
-    if p == n then
+    if prevIndex == nextIndex then
         --The corner couldn't be eliminated,
         return cornerIndex, cornerIndex
     end
-    pPosition = path[p]
-    nPosition = path[n]
+    prevPosition = path[prevIndex]
+    nextPosition = path[nextIndex]
 
-    --The previous loop changed p and n, so the corner node can be eliminated
+    --The previous loop changed prevIndex and neext, so the corner node can be eliminated
     --check whether even more nodes can be eliminated in either direction
 
-    --March next point forwards (towards finish) as far as it's unblocked
-    local startN = n
-    n = pathLen
+    --March nextIndex point forwards (towards finish) as far as it's unblocked
+    local startN = nextIndex
+    nextIndex = pathLen
     for i = startN + 1, pathLen do
-        nPosition = path[i]
-        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
-            n = i - 1
-            nPosition = path[n]
+        nextPosition = path[i]
+        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
+            nextIndex = i - 1
+            nextPosition = path[nextIndex]
             break
         end
     end
 
     ----March previous point backwards (towards start) as far as it's unblocked
-    local startP = p
-    p = minStart
+    local startP = prevIndex
+    prevIndex = minStart
     for i = startP - 1, minStart, -1 do
-        pPosition = path[i]
-        if not IsLineTraversableCached(mesh, pPosition, nPosition) then
-            p = i - 1
-            --pPosition = path[p]
+        prevPosition = path[i]
+        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
+            prevIndex = i + 1
+            --prevPosition = path[prevIndex]
             break
         end
     end
 
     --Return the two nodes that must be kept - everything between them can be eliminated
-    return p, n
+    return prevIndex, nextIndex
 end
 
 
@@ -917,23 +916,23 @@ local function SimplifyCopyNodes(path: PathList, first: number, last: number, si
         local currentPosition = path[i]
         local currentPositionX = currentPosition.X
         local currentPositionZ = currentPosition.Z
-        local n = i + 1
+        local nextIndex = i + 1
 
         table.insert(simplified, currentPosition)
 
-        if currentPositionX == path[n].X then
+        if currentPositionX == path[nextIndex].X then
             --Advance through intermediate nodes in the straight X line
-            while (n < last) and (currentPositionX == path[n+1].X) do
-                n += 1
+            while (nextIndex < last) and (currentPositionX == path[nextIndex + 1].X) do
+                nextIndex += 1
             end
 
-        elseif currentPositionZ == path[n].Z then
+        elseif currentPositionZ == path[nextIndex].Z then
             --Advance through intermediate nodes in the straight Z line
-            while (n < last) and (currentPositionZ == path[n+1].Z) do
-                n += 1
+            while (nextIndex < last) and (currentPositionZ == path[nextIndex + 1].Z) do
+                nextIndex += 1
             end
         end
-        i = n
+        i = nextIndex
     end
 
     if last >= first then
@@ -952,16 +951,15 @@ local function SimplifyPass2(mesh: PathMesh, path: PathList): PathList
         local currNode = path[i]
         table.insert(extraSimplePath, currNode)
 
-        --Trace as far ahead as can be reached in a straight line
-        local j = i + 2
-        while (j <= pathLen) and IsLineTraversableCached(mesh, currNode, path[j]) do
-            j += 1
+        --Trace as far ahead as can be reached by a straight line
+        local reachableIndex = i + 2
+        while (reachableIndex <= pathLen) and IsLineTraversableCached(mesh, currNode, path[reachableIndex]) do
+            reachableIndex += 1
         end
-        j -= 1
-        i = j
+        reachableIndex -= 1
+        i = reachableIndex
     end
-
-    table.insert(extraSimplePath, path[i])
+    table.insert(extraSimplePath, path[pathLen])
     return extraSimplePath
 end
 
@@ -995,13 +993,13 @@ function PathLib.SimplifyPath(mesh: PathMesh, path: PathList): PathList
             end
 
             --Adjecent positions match in X or Z. If how 3 consecutive nodes match differs, it's a corner
-            if (path[i-1].X == currentPositionX) ~= (currentPositionX == path[i+1].X) then
-                local p, n = TrySimplifyCorner(mesh, path, i, lastFixedNode)
+            if (path[i - 1].X == currentPositionX) ~= (currentPositionX == path[i + 1].X) then
+                local prevIndex, nextIndex = TrySimplifyCorner(mesh, path, i, lastFixedNode)
 
-                if p+1 < n then
-                    SimplifyCopyNodes(path, lastFixedNode, p, simplePath)
-                    lastFixedNode = n
-                    i = n - 1 --i gets incremented below, so we continue at i=n
+                if prevIndex + 1 < nextIndex then
+                    SimplifyCopyNodes(path, lastFixedNode, prevIndex, simplePath)
+                    lastFixedNode = nextIndex
+                    i = nextIndex - 1 --i gets incremented below, so we continue at i=n
                 end
             end
             i += 1
