@@ -315,6 +315,15 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
     table.freeze(sorted)
 end
 
+local function ResetCachesForBlockChange(mesh: PathMesh)
+    --Clear the cache for line testing since it's invalid
+    for _, cache in mesh.LineCache do
+        table.clear(cache)
+    end
+    --Clear the cache for path simplification since it's now invalid
+    table.clear(mesh.SimplifyCache)
+end
+
 
 --Mark all nodes in the specified region as blocked
 function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
@@ -336,12 +345,7 @@ function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector
             index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
         end
     end
-    --Clear the cache for line testing since it's invalid
-    for _, cache in mesh.LineCache do
-        table.clear(cache)
-    end
-    --Clear the cache for path simplification since it's now invalid
-    table.clear(mesh.SimplifyCache)
+    ResetCachesForBlockChange(mesh)
 end
 
 
@@ -365,12 +369,7 @@ function PathLib.UnblockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vect
             index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
         end
     end
-    --Clear the cache for line testing since it's invalid
-    for _, cache in mesh.LineCache do
-        table.clear(cache)
-    end
-    --Clear the cache for path simplification since it's now invalid
-    table.clear(mesh.SimplifyCache)
+    ResetCachesForBlockChange(mesh)
 end
 
 
@@ -448,6 +447,8 @@ local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState): bo
         value *= 2
         bits -= 1
     end
+
+    ResetCachesForBlockChange(mesh)
     return true
 end
 PathLib.RestoreBlockedStates = RestoreBlockedStates
