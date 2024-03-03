@@ -27,10 +27,11 @@ export type PathMesh = {
     IsFinalized: boolean,
     FinalizeSeed: number,
     GoalNodes: {PathNode},
-    LineCache: {[number]: {[number]: boolean}},
+    LineCache: {[number]: boolean},
     SimplifyCache: {[Vector3]: Vector3},
     FrontWaveTable: {[number]: PathNode},
     NextWaveTable: {[number]: PathNode},
+
 }
 export type PathList = {Vector3}
 export type MeshBlockedState = buffer
@@ -45,13 +46,13 @@ PathLib.GRID_COORD_OFFSET = GRID_COORD_OFFSET
 --[[
 Before I knew Vector3 were value types, I made my own position-to-key system. After discovering
 they are value types, a benchmark showed my system is about 5% faster for my cast, so here it is.
-Since places won't be huge and nodes are limited to integer coordinates, we can pack the 3 coordinates
-using some bits for each one. Since there are effectively 53 mantissa bits, I chose floor(53/3) bits
-per coordinate, resulting in a multiplier of 2^17 = 131072. I keep room for 3 coordinates just in case
-- for now, we only use X and Z. Since we want max negative coordinate to map to 0, we add half the
-multiplier. This allows maps to span the region from -65536 to +65535
+Since places won't be huge and nodes are limited to integer coordinates, we can pack the coordinates
+using some bits for each one. Since there are effectively 53 mantissa bits, I chose floor(53/4) bits
+per coordinate, resulting in a multiplier of 2^13 = 8192. I chose to divide by 4 to allow packing
+the descripton of a line into a single number, which helps with the line cache.
+Thus, pathfinding nodes can span the range of coordinates -4096 to +4095, or approximately far enough
 ]]
-local GRID_INDEX_MUL = 131072
+local GRID_INDEX_MUL = 8192
 
 --Actual module-local variables
 local EnableDebugMessages: boolean = false
@@ -79,13 +80,35 @@ end
 
 --Convert a coordinate to a node index
 local function CoordToIndex(x: number, z: number): number
-    return (x + (GRID_INDEX_MUL / 2)) + ((z + (GRID_INDEX_MUL / 2)) * GRID_INDEX_MUL)
+    --TODO: Maybe take advantage of grid size to increase range?
+    --Reorganizing terms results in better bytecode:
+    --return (x + (GRID_INDEX_MUL / 2)) + ((z + (GRID_INDEX_MUL / 2)) * GRID_INDEX_MUL)
+    return x + (z * GRID_INDEX_MUL) + ((GRID_INDEX_MUL / 2) + (GRID_INDEX_MUL / 2) * GRID_INDEX_MUL)
 end
 
 
 --Convert an adjustment to a coordinate to an adjustment to an index
 local function DeltaCoordToIndex(x: number, z: number): number
+    --TODO: Maybe take advantage of grid size to increase range?
     return (x) + (z * GRID_INDEX_MUL)
+end
+--Convert an adjustment to an X coordinate to an adjustment to an index
+local function DeltaXCoordToIndex(x: number): number
+    return (x)
+end
+--Convert an adjustment to a Z coordinate to an adjustment to an index
+local function DeltaZCoordToIndex(z: number): number
+    return (z * GRID_INDEX_MUL)
+end
+
+
+--Combine a pair of indexes into a single one describing a line
+local function CombineIndexesIntoLine(a: number, b: number): number
+    if a <= b then
+        return a + (b * (GRID_INDEX_MUL * GRID_INDEX_MUL))
+    else
+        return b + (a * (GRID_INDEX_MUL * GRID_INDEX_MUL))
+    end
 end
 
 
@@ -253,7 +276,7 @@ function PathLib.AddNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3
                 nodes[index] = node
                 table.insert(sorted, node)
             end
-            index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+            index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
 end
@@ -284,22 +307,22 @@ function PathLib.FinalizeMesh(mesh: PathMesh): ()
     for index, currentNode in nodes do
         local neighbors: {PathNode} = currentNode[IDX_NEIGHBORS]
 
-        neighbor = nodes[index + DeltaCoordToIndex(-GRID_COORD_SPACING, 0)]
+        neighbor = nodes[index + DeltaXCoordToIndex(-GRID_COORD_SPACING)]
         if neighbor then
             table.insert(neighbors, neighbor)
         end
 
-        neighbor = nodes[index + DeltaCoordToIndex( GRID_COORD_SPACING, 0)]
+        neighbor = nodes[index + DeltaXCoordToIndex( GRID_COORD_SPACING)]
         if neighbor then
             table.insert(neighbors, neighbor)
         end
 
-        neighbor = nodes[index + DeltaCoordToIndex(0, -GRID_COORD_SPACING)]
+        neighbor = nodes[index + DeltaZCoordToIndex(-GRID_COORD_SPACING)]
         if neighbor then
             table.insert(neighbors, neighbor)
         end
 
-        neighbor = nodes[index + DeltaCoordToIndex(0,  GRID_COORD_SPACING)]
+        neighbor = nodes[index + DeltaZCoordToIndex( GRID_COORD_SPACING)]
         if neighbor then
             table.insert(neighbors, neighbor)
         end
@@ -317,9 +340,7 @@ end
 
 local function ResetCachesForBlockChange(mesh: PathMesh)
     --Clear the cache for line testing since it's invalid
-    for _, cache in mesh.LineCache do
-        table.clear(cache)
-    end
+    table.clear(mesh.LineCache)
     --Clear the cache for path simplification since it's now invalid
     table.clear(mesh.SimplifyCache)
 end
@@ -342,7 +363,7 @@ function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector
             if node then
                 node[IDX_BLOCKED] = true
             end
-            index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+            index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
     ResetCachesForBlockChange(mesh)
@@ -366,7 +387,7 @@ function PathLib.UnblockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vect
             if node then
                 node[IDX_BLOCKED] = false
             end
-            index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+            index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
     ResetCachesForBlockChange(mesh)
@@ -618,7 +639,7 @@ end
 --]]
 local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
     --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or nodes might be missed
-    local radius = GRID_COORD_SPACING / 2 - 0.00001
+    local radius = (GRID_COORD_SPACING / 2) - (2^-16)
     local nodes = mesh.Nodes
     local node: PathNode
 
@@ -633,8 +654,8 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     local stepX = if deltaX > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
     local stepZ = if deltaZ > 0 then GRID_COORD_SPACING else -GRID_COORD_SPACING
     --How to adjust the index to get to the cell in the corresponding direction
-    local offsetX = DeltaCoordToIndex(stepX, 0)
-    local offsetZ = DeltaCoordToIndex(0, stepZ)
+    local offsetX = DeltaXCoordToIndex(stepX)
+    local offsetZ = DeltaZCoordToIndex(stepZ)
 
     --Two points opposite a circle by the normal of the line
     local rduX = radius * du.X
@@ -670,9 +691,9 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
             --Otherwise, check one cell for each line
             local indexDelta
             if pAXGrid < pBXGrid then
-                indexDelta = DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+                indexDelta = DeltaXCoordToIndex(GRID_COORD_SPACING)
             else
-                indexDelta = DeltaCoordToIndex(-GRID_COORD_SPACING, 0)
+                indexDelta = DeltaXCoordToIndex(-GRID_COORD_SPACING)
             end
 
             for zz = pAZGrid, pAEndZGrid, stepZ do
@@ -682,6 +703,7 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
                 end
                 node = nodes[index + indexDelta]
                 if not node or node[IDX_BLOCKED] then
+
                     return false
                 end
                 index += offsetZ
@@ -707,9 +729,9 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
             --Otherwise, check one cell for each line
             local indexDelta
             if pAZGrid < pBZGrid then
-                indexDelta = DeltaCoordToIndex(0, GRID_COORD_SPACING)
+                indexDelta = DeltaZCoordToIndex(GRID_COORD_SPACING)
             else
-                indexDelta = DeltaCoordToIndex(0, -GRID_COORD_SPACING)
+                indexDelta = DeltaZCoordToIndex(-GRID_COORD_SPACING)
             end
 
             for xx = pAXGrid, pAEndXGrid, stepX do
@@ -729,10 +751,12 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     end
 
     --The T values at which a grid crossing takes place
-    local tMaxXA = (pAXGrid + (stepX * 0.5) - pAX) / deltaX
-    local tMaxZA = (pAZGrid + (stepZ * 0.5) - pAZ) / deltaZ
-    local tMaxXB = (pBXGrid + (stepX * 0.5) - pBX) / deltaX
-    local tMaxZB = (pBZGrid + (stepZ * 0.5) - pBZ) / deltaZ
+    local halfStepX = stepX * 0.5
+    local halfStepZ = stepZ * 0.5
+    local tMaxXA = (pAXGrid + halfStepX - pAX) / deltaX
+    local tMaxZA = (pAZGrid + halfStepZ - pAZ) / deltaZ
+    local tMaxXB = (pBXGrid + halfStepX - pBX) / deltaX
+    local tMaxZB = (pBZGrid + halfStepZ - pBZ) / deltaZ
 
     --The change in T a step in each direction adavances.
     local tDeltaX = stepX / deltaX
@@ -794,25 +818,19 @@ local function IsLineTraversableCached(mesh: PathMesh, start: Vector3, finish: V
         return IsLineTraversableUncached(mesh, start, finish)
     end
 
-    local lowIndex = CoordToIndex(start.X, start.Z)
-    local highIndex = CoordToIndex(finish.X, finish.Z)
-    if lowIndex > highIndex then
-        lowIndex, highIndex = highIndex, lowIndex
-    end
+    local startIndex = CoordToIndex(start.X, start.Z)
+    local finishIndex = CoordToIndex(finish.X, finish.Z)
 
     local lineCache = mesh.LineCache
-    local cache = lineCache[lowIndex]
-    if not cache then
-        cache = {}
-        mesh.LineCache[lowIndex] = cache
-    end
+    local index = CombineIndexesIntoLine(startIndex, finishIndex)
 
-    local value = cache[highIndex]
-    if value then
+    local value = lineCache[index]
+    if value ~= nil then
         return value
     end
+
     value = IsLineTraversableUncached(mesh, start, finish)
-    cache[highIndex] = value
+    lineCache[index] = value
     return value
 end
 PathLib.IsLineTraversable = IsLineTraversableCached
@@ -836,7 +854,7 @@ function PathLib.IsAreaUnblocked(mesh: PathMesh, minCorner: Vector3, maxCorner: 
                 return false
             end
 
-            index += DeltaCoordToIndex(GRID_COORD_SPACING, 0)
+            index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
 
