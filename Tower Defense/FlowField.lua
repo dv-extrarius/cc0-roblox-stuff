@@ -4,59 +4,54 @@ This work is marked with CC0 1.0 Universal.
 To view a copy of this license, visit http://creativecommons.org/publicdomain/zero/1.0
 --
 This is an implementation of an essentially 2d pathfinding system. It ignores Y coordinates, and
-uses a grid of nodes that are manually marked blocked or unblocked by the library's user.
+uses a grid of cells that are manually marked blocked or unblocked by the library's user.
 
-Work In Progress - This is modified from my regular PathLib in an attempt to make nice flow fields.
+Work In Progress - This is modified from my regular Path-Lib in an attempt to make nice flow fields.
 It's not quite there yet.
 ]]
 --!strict
 --!optimize 2
 
-local PathLib = {}
+local FlowField = {}
 
---Constants used to index the PathNode type
+--Constants used to index the FieldCell type
 local IDX_NEIGHBORS = 1
 local IDX_POSITION = 2
 local IDX_INDEX = 3
 local IDX_TOTALCOST = 4
 local IDX_BLOCKED = 5
-local IDX_NEXTNODE = 6
-local IDX_DIRECTION = 7
+local IDX_DIRECTION = 6
 
-type PathNode = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
---{Neighbors: {PathNode}, Position: Vector3, Index: number, TotalCost: number, Blocked: boolean, NextNode: PathNode?, Direction: Vector3}
-export type PathMesh = {
-    Nodes: {[number]: PathNode},
-    SortedNodes: {PathNode},
-    BorderNodes: {[number]: PathNode},
+type FieldCell = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
+--{Neighbors: {FieldCell}, Position: Vector3, Index: number, TotalCost: number, Blocked: boolean, Direction: Vector3}
+export type Field = {
+    Cells: {[number]: FieldCell},
+    SortedCells: {FieldCell},
+    BorderCells: {[number]: FieldCell},
     IsFinalized: boolean,
-    FinalizeSeed: number,
-    GoalNodes: {PathNode},
+    GoalCells: {FieldCell},
     LineCache: {[number]: boolean},
-    SimplifyCache: {[Vector3]: Vector3},
-    FrontWaveTable: {[number]: PathNode},
-    NextWaveTable: {[number]: PathNode},
-    ThirdWaveTable: {[number]: PathNode},
+    FrontWaveTable: {[number]: FieldCell},
+    NextWaveTable: {[number]: FieldCell},
 
 }
-export type PathList = {Vector3}
-export type MeshBlockedState = buffer
+export type FieldBlockedState = buffer
 
---Path nodes are spaced every other stud
+--Field cells are spaced every other stud
 local GRID_COORD_SPACING = 6
-PathLib.GRID_COORD_SPACING = GRID_COORD_SPACING
---Path nodes are centerd in each grid square
+FlowField.GRID_COORD_SPACING = GRID_COORD_SPACING
+--Field cells are centerd in each grid square
 local GRID_COORD_OFFSET = 3
-PathLib.GRID_COORD_OFFSET = GRID_COORD_OFFSET
+FlowField.GRID_COORD_OFFSET = GRID_COORD_OFFSET
 
 --[[
 Before I knew Vector3 were value types, I made my own position-to-key system. After discovering
 they are value types, a benchmark showed my system is about 5% faster for my cast, so here it is.
-Since places won't be huge and nodes are limited to integer coordinates, we can pack the coordinates
+Since places won't be huge and cells are limited to integer coordinates, we can pack the coordinates
 using some bits for each one. Since there are effectively 53 mantissa bits, I chose floor(53/4) bits
 per coordinate, resulting in a multiplier of 2^13 = 8192. I chose to divide by 4 to allow packing
 the descripton of a line into a single number, which helps with the line cache.
-Thus, pathfinding nodes can span the range of coordinates -4096 to +4095, or approximately far enough
+Thus, pathfinding cells can span the range of coordinates -4096 to +4095, or approximately far enough
 ]]
 local GRID_INDEX_MUL = 8192
 
@@ -84,13 +79,14 @@ local function CustomError(level: number, ...: any)
 end
 
 
---Convert a coordinate to a node index
+--Convert a coordinate to a cell index
 local function CoordToIndex(x: number, z: number): number
     --TODO: Maybe take advantage of grid size to increase range?
     --Reorganizing terms results in better bytecode:
     --return (x + (GRID_INDEX_MUL / 2)) + ((z + (GRID_INDEX_MUL / 2)) * GRID_INDEX_MUL)
     return x + (z * GRID_INDEX_MUL) + ((GRID_INDEX_MUL / 2) + (GRID_INDEX_MUL / 2) * GRID_INDEX_MUL)
 end
+FlowField.CoordToIndex = CoordToIndex
 
 
 --Convert an adjustment to a coordinate to an adjustment to an index
@@ -120,34 +116,34 @@ local function CombineIndexesIntoLine(a: number, b: number): number
 end
 
 
---Function to snap coordinates to pathing grid by rounding
-local function ToPathGridRoundSingle(coord: number): number
+--Function to snap coordinates to field grid by rounding
+local function ToCellGridRoundSingle(coord: number): number
     return math.round((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
-local function ToPathGridRound(coord: Vector3): Vector3
-    return Vector3.new(ToPathGridRoundSingle(coord.X), 0, ToPathGridRoundSingle(coord.Z))
+local function ToCellGridRound(coord: Vector3): Vector3
+    return Vector3.new(ToCellGridRoundSingle(coord.X), 0, ToCellGridRoundSingle(coord.Z))
 end
-PathLib.ToPathGridRound = ToPathGridRound
+FlowField.ToCellGridRound = ToCellGridRound
 
 
---Function to snap coordinates to pathing grid by flooring
-local function ToPathGridFloorSingle(coord: number): number
+--Function to snap coordinates to field grid by flooring
+local function ToCellGridFloorSingle(coord: number): number
     return math.floor((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
-local function ToPathGridFloor(coord: Vector3): Vector3
-    return Vector3.new(ToPathGridFloorSingle(coord.X), 0, ToPathGridFloorSingle(coord.Z))
+local function ToCellGridFloor(coord: Vector3): Vector3
+    return Vector3.new(ToCellGridFloorSingle(coord.X), 0, ToCellGridFloorSingle(coord.Z))
 end
-PathLib.ToPathGridFloor = ToPathGridFloor
+FlowField.ToCellGridFloor = ToCellGridFloor
 
 
---Function to snap coordinates to pathing grid by ceiling
-local function ToPathGridCeilSingle(coord: number): number
+--Function to snap coordinates to field grid by ceiling
+local function ToCellGridCeilSingle(coord: number): number
     return math.ceil((coord - GRID_COORD_OFFSET) * (1 / GRID_COORD_SPACING)) * GRID_COORD_SPACING + GRID_COORD_OFFSET
 end
-local function ToPathGridCeil(coord: Vector3): Vector3
-    return Vector3.new(ToPathGridCeilSingle(coord.X), 0, ToPathGridCeilSingle(coord.Z))
+local function ToCellGridCeil(coord: Vector3): Vector3
+    return Vector3.new(ToCellGridCeilSingle(coord.X), 0, ToCellGridCeilSingle(coord.Z))
 end
-PathLib.ToPathGridCeil = ToPathGridCeil
+FlowField.ToCellGridCeil = ToCellGridCeil
 
 
 --Function to test whether a coordinate is on the grid
@@ -157,7 +153,7 @@ end
 local function IsOnPathGrid(coord: Vector3): boolean
     return IsOnPathGridSingle(coord.X) and IsOnPathGridSingle(coord.Z)
 end
-PathLib.IsOnPathGrid = IsOnPathGrid
+FlowField.IsOnPathGrid = IsOnPathGrid
 
 
 --Function to fit an area to the grid
@@ -171,103 +167,98 @@ local function AlignAreaToGrid(minCorner: Vector3, maxCorner: Vector3, includePa
     local maxCornerX = math.max(x0, x1)
     local maxCornerZ = math.max(z0, z1)
     if not includePartial then
-        return Vector3.new(ToPathGridCeilSingle(minCornerX), 0, ToPathGridCeilSingle(minCornerZ)), Vector3.new(ToPathGridFloorSingle(maxCornerX), 0, ToPathGridFloorSingle(maxCornerZ))
+        return Vector3.new(ToCellGridCeilSingle(minCornerX), 0, ToCellGridCeilSingle(minCornerZ)), Vector3.new(ToCellGridFloorSingle(maxCornerX), 0, ToCellGridFloorSingle(maxCornerZ))
     else
-        return Vector3.new(ToPathGridFloorSingle(minCornerX), 0, ToPathGridFloorSingle(minCornerZ)), Vector3.new(ToPathGridCeilSingle(maxCornerX), 0, ToPathGridCeilSingle(maxCornerZ))
+        return Vector3.new(ToCellGridFloorSingle(minCornerX), 0, ToCellGridFloorSingle(minCornerZ)), Vector3.new(ToCellGridCeilSingle(maxCornerX), 0, ToCellGridCeilSingle(maxCornerZ))
     end
 end
-PathLib.AlignAreaToGrid = AlignAreaToGrid
+FlowField.AlignAreaToGrid = AlignAreaToGrid
 
 
---Initialize PathLib with the provided settings
-function PathLib.Configure(config: {EnableDebugMessages: boolean?}): ()
+--Initialize FlowField with the provided settings
+function FlowField.Configure(config: {EnableDebugMessages: boolean?}): ()
     if config.EnableDebugMessages ~= nil then
         EnableDebugMessages = config.EnableDebugMessages and true or false --cast to boolean
     end
 end
 
 
---Create an empty mesh
-function PathLib.NewMesh(seed: number?): PathMesh
+--Create an empty field
+function FlowField.NewField(): Field
     return {
-        Nodes = {},
-        SortedNodes = {},
-        BorderNodes = {},
+        Cells = {},
+        SortedCells = {},
+        BorderCells = {},
         IsFinalized = false,
-        FinalizeSeed = seed or os.time(),
-        GoalNodes = {},
+        GoalCells = {},
         LineCache = {},
-        SimplifyCache = {},
         FrontWaveTable = {},
         NextWaveTable = {},
-        ThirdWaveTable = {},
     }
 end
 
 
---Clone a mesh. Finalizes the nodes if the original is finialized
-function PathLib.Clone(oldMesh: PathMesh, skipFinalize: boolean?): PathMesh
+--Clone a field. Finalizes the cells if the original is finialized
+function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
 
-    local newMesh: PathMesh = {
-        Nodes = {},
-        SortedNodes = table.create(#oldMesh.SortedNodes),
-        BorderNodes = {},
+    local newField: Field = {
+        Cells = {},
+        SortedCells = table.create(#oldField.SortedCells),
+        BorderCells = {},
         IsFinalized = false,
-        FinalizeSeed = oldMesh.FinalizeSeed,
-        GoalNodes = table.create(#oldMesh.GoalNodes),
+        GoalCells = table.create(#oldField.GoalCells),
         LineCache = {},
-        SimplifyCache = {},
         FrontWaveTable = {},
         NextWaveTable = {},
-        ThirdWaveTable = {},
     }
-    local oldNodes = oldMesh.Nodes
-    local oldSorted = oldMesh.SortedNodes
-    local newNodes = newMesh.Nodes
-    local newSorted = newMesh.SortedNodes
+    local oldCells = oldField.Cells
+    local oldSorted = oldField.SortedCells
+    local newCells = newField.Cells
+    local newSorted = newField.SortedCells
 
-    for index, oldNode in oldNodes do
-        local newNode = table.clone(oldNode)
+    for index, oldCell in oldCells do
+        local newCell = table.clone(oldCell)
 
-        newNode[IDX_NEIGHBORS] = table.create(4)
-        newNode[IDX_NEXTNODE] = nil
-        newNodes[index] = newNode
+        newCell[IDX_NEIGHBORS] = table.create(4)
+        newCells[index] = newCell
     end
-    for _, oldGoal in oldMesh.GoalNodes do
-        table.insert(newMesh.GoalNodes, newNodes[oldGoal[IDX_INDEX]])
+    for _, oldGoal in oldField.GoalCells do
+        table.insert(newField.GoalCells, newCells[oldGoal[IDX_INDEX]])
     end
-    --Copy sorted nodes from sorted nodes, so the new one is sorted if the old one is
-    for _, oldNode in oldSorted do
-        table.insert(newSorted, newNodes[oldNode[IDX_INDEX]])
+    --Copy sorted cells from sorted cells, so the new one is sorted if the old one is
+    for _, oldCell in oldSorted do
+        table.insert(newSorted, newCells[oldCell[IDX_INDEX]])
     end
 
-    if oldMesh.IsFinalized and not skipFinalize then
-        newMesh.BorderNodes = oldMesh.BorderNodes
-        --Connect each node to its 4-way neighbors
-        for index, newNode in newNodes do
-            local newNeighbors: {PathNode} = newNode[IDX_NEIGHBORS]
-            local oldNeighbors: {PathNode} = oldNodes[index][IDX_NEIGHBORS]
+    if oldField.IsFinalized and not skipFinalize then
+        local newBorderCells = oldField.BorderCells
+        newField.BorderCells = newBorderCells
+        --Connect each cell to its 4-way neighbors
+        for index, newCell in newCells do
+            local newNeighbors: {FieldCell} = newCell[IDX_NEIGHBORS]
+            local oldNeighbors: {FieldCell} = oldCells[index][IDX_NEIGHBORS]
 
             for i, neighbor in oldNeighbors do
-                newNeighbors[i] = newNodes[neighbor[IDX_INDEX]]
+                local index = neighbor[IDX_INDEX]
+                newNeighbors[i] = newCells[index] or newBorderCells[index]
             end
-            --The post-shuffled order was copied, don't reshuffle
+
             table.freeze(newNeighbors)
         end
 
-        newMesh.IsFinalized = true
-        table.freeze(newNodes)
+        newField.IsFinalized = true
+        table.freeze(newCells)
         table.freeze(newSorted)
     end
 
-    return newMesh
+    return newField
 end
 
 
---Add nodes to a mesh to cover a specified region
-function PathLib.AddNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
-    local nodes = mesh.Nodes
-    local sorted = mesh.SortedNodes
+--Add cells to a field to cover a specified region
+function FlowField.AddArea(field: Field, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
+    local cells = field.Cells
+    local sorted = field.SortedCells
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
     local minCornerX = minCorner.X
@@ -277,18 +268,17 @@ function PathLib.AddNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3
         local index = CoordToIndex(minCornerX, z)
 
         for x = minCornerX, maxCornerX, GRID_COORD_SPACING do
-            if not nodes[index] then
-                local node: PathNode = {
+            if not cells[index] then
+                local cell: FieldCell = {
                     table.create(4),               --Neighbors
                     Vector3.new(x, 0, z),          --Position
                     index,                         --Index
                     math.huge,                     --TotalCost
                     false,                         --Blocked
-                    nil,                           --NextNode
                     Vector3.zero,                  --Direction
                 }
-                nodes[index] = node
-                table.insert(sorted, node)
+                cells[index] = cell
+                table.insert(sorted, cell)
             end
             index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
@@ -296,116 +286,90 @@ function PathLib.AddNodes(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3
 end
 
 
---Fisher-Yates fair shuffle
-local function shuffle<T>(arr: {T}): {T}
-    local arrLen = #arr
-    for i = 1, arrLen - 1 do
-        local j = math.random(i, arrLen)
-        arr[i], arr[j] = arr[j], arr[i]
-    end
-    return arr
-end
-
-local frozenEmptyNeighbors: {PathNode} = table.freeze({})
-local function MakeBorderNode(neighborIndex: number, borderPosition: Vector3): PathNode
+local frozenEmptyNeighbors: {FieldCell} = table.freeze({})
+local borderCellStr = "BorderCell"
+local function MakeBorderCell(neighborIndex: number, borderPosition: Vector3): FieldCell
     return table.freeze({
         frozenEmptyNeighbors, --Neighbors
         borderPosition,       --Position
         neighborIndex,        --Index
         math.huge,            --TotalCost
         true,                 --Blocked
-        nil,                  --NextNode
-        Vector3.zero          --Direction
-    } :: PathNode)
+        Vector3.zero,         --Direction
+        borderCellStr --extra to make them obvious
+    } :: FieldCell)
 end
 
---Do final processing on each node in the mesh
-function PathLib.FinalizeMesh(mesh: PathMesh): ()
-    local nodes = mesh.Nodes
-    local borderNodes = mesh.BorderNodes
-    local sorted = mesh.SortedNodes
-    local seed = mesh.FinalizeSeed
-    local neighbor: PathNode?
+
+--Do final processing on each cell in the field
+function FlowField.FinalizeField(field: Field): ()
+    local cells = field.Cells
+    local borderCells = field.BorderCells
+    local sorted = field.SortedCells
+    local neighbor: FieldCell?
     local neighborIndex: number
 
-    --Make the sorted nodes actually sorted (by index)
+    --Make the sorted cells actually sorted (by index)
     table.sort(sorted, function (lhs, rhs) return lhs[IDX_INDEX] < rhs[IDX_INDEX] end)
 
-    --Connect each node to 4-way neighbors if they exist
-    for index, currentNode in nodes do
-        local neighbors: {PathNode} = currentNode[IDX_NEIGHBORS]
+    --Connect each cell to 4-way neighbors if they exist and create border cells if they don't
+    for index, currentCell in cells do
+        local neighbors: {FieldCell} = currentCell[IDX_NEIGHBORS]
 
         neighborIndex = index + DeltaXCoordToIndex(-GRID_COORD_SPACING)
-        neighbor = nodes[neighborIndex]
+        neighbor = cells[neighborIndex] or borderCells[neighborIndex]
         if not neighbor then
-            neighbor = borderNodes[neighborIndex]
-            if not neighbor then
-                neighbor = MakeBorderNode(neighborIndex, currentNode[IDX_POSITION] - GRID_COORD_SPACING*Vector3.xAxis)
-                borderNodes[neighborIndex] = neighbor
-            end
+            neighbor = MakeBorderCell(neighborIndex, currentCell[IDX_POSITION] - GRID_COORD_SPACING*Vector3.xAxis)
+            borderCells[neighborIndex] = neighbor
         end
-        table.insert(neighbors, neighbor :: PathNode)
+        table.insert(neighbors, neighbor :: FieldCell)
 
 
         neighborIndex = index + DeltaXCoordToIndex(GRID_COORD_SPACING)
-        neighbor = nodes[neighborIndex]
+        neighbor = cells[neighborIndex] or borderCells[neighborIndex]
         if not neighbor then
-            neighbor = borderNodes[neighborIndex]
-            if not neighbor then
-                neighbor = MakeBorderNode(neighborIndex, currentNode[IDX_POSITION] + GRID_COORD_SPACING*Vector3.xAxis)
-                borderNodes[neighborIndex] = neighbor
-            end
+            neighbor = MakeBorderCell(neighborIndex, currentCell[IDX_POSITION] + GRID_COORD_SPACING*Vector3.xAxis)
+            borderCells[neighborIndex] = neighbor
         end
-        table.insert(neighbors, neighbor :: PathNode)
+        table.insert(neighbors, neighbor :: FieldCell)
 
 
         neighborIndex = index + DeltaZCoordToIndex(-GRID_COORD_SPACING)
-        neighbor = nodes[neighborIndex]
+        neighbor = cells[neighborIndex] or borderCells[neighborIndex]
         if not neighbor then
-            neighbor = borderNodes[neighborIndex]
-            if not neighbor then
-                neighbor = MakeBorderNode(neighborIndex, currentNode[IDX_POSITION] - GRID_COORD_SPACING*Vector3.zAxis)
-                borderNodes[neighborIndex] = neighbor
-            end
+            neighbor = MakeBorderCell(neighborIndex, currentCell[IDX_POSITION] - GRID_COORD_SPACING*Vector3.zAxis)
+            borderCells[neighborIndex] = neighbor
         end
-        table.insert(neighbors, neighbor :: PathNode)
+        table.insert(neighbors, neighbor :: FieldCell)
 
 
         neighborIndex = index + DeltaZCoordToIndex(GRID_COORD_SPACING)
-        neighbor = nodes[neighborIndex]
+        neighbor = cells[neighborIndex] or borderCells[neighborIndex]
         if not neighbor then
-            neighbor = borderNodes[neighborIndex]
-            if not neighbor then
-                neighbor = MakeBorderNode(neighborIndex, currentNode[IDX_POSITION] + GRID_COORD_SPACING*Vector3.zAxis)
-                borderNodes[neighborIndex] = neighbor
-            end
+            neighbor = MakeBorderCell(neighborIndex, currentCell[IDX_POSITION] + GRID_COORD_SPACING*Vector3.zAxis)
+            borderCells[neighborIndex] = neighbor
         end
-        table.insert(neighbors, neighbor :: PathNode)
+        table.insert(neighbors, neighbor :: FieldCell)
 
-
-        --math.randomseed(seed + index)
-        --shuffle(neighbors)
 
         table.freeze(neighbors)
     end
 
-    mesh.IsFinalized = true
-    table.freeze(nodes)
-    table.freeze(borderNodes)
+    field.IsFinalized = true
+    table.freeze(cells)
+    table.freeze(borderCells)
     table.freeze(sorted)
 end
 
-local function ResetCachesForBlockChange(mesh: PathMesh)
-    --Clear the cache for line testing since it's invalid
-    table.clear(mesh.LineCache)
-    --Clear the cache for path simplification since it's now invalid
-    table.clear(mesh.SimplifyCache)
+local function ResetCachesForBlockChange(field: Field)
+    --Clear the cache for line testing since blocking changes invalidate it
+    table.clear(field.LineCache)
 end
 
 
---Mark all nodes in the specified region as blocked
-function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
-    local nodes = mesh.Nodes
+--Mark all cells in the specified region as blocked
+function FlowField.BlockArea(field: Field, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
+    local cells = field.Cells
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
     local minCornerX = minCorner.X
@@ -415,21 +379,21 @@ function PathLib.BlockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector
         local index = CoordToIndex(minCornerX, z)
 
         for x = minCornerX, maxCornerX, GRID_COORD_SPACING do
-            local node = nodes[index]
+            local cell = cells[index]
 
-            if node then
-                node[IDX_BLOCKED] = true
+            if cell then
+                cell[IDX_BLOCKED] = true
             end
             index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
-    ResetCachesForBlockChange(mesh)
+    ResetCachesForBlockChange(field)
 end
 
 
---Mark all nodes in the specified region as unblocked
-function PathLib.UnblockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
-    local nodes = mesh.Nodes
+--Mark all cells in the specified region as unblocked
+function FlowField.UnblockArea(field: Field, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): ()
+    local cells = field.Cells
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
     local minCornerX = minCorner.X
@@ -439,21 +403,21 @@ function PathLib.UnblockArea(mesh: PathMesh, minCorner: Vector3, maxCorner: Vect
         local index = CoordToIndex(minCornerX, z)
 
         for x = minCornerX, maxCornerX, GRID_COORD_SPACING do
-            local node = nodes[index]
+            local cell = cells[index]
 
-            if node then
-                node[IDX_BLOCKED] = false
+            if cell then
+                cell[IDX_BLOCKED] = false
             end
             index += DeltaXCoordToIndex(GRID_COORD_SPACING)
         end
     end
-    ResetCachesForBlockChange(mesh)
+    ResetCachesForBlockChange(field)
 end
 
 
---Save the current blocked state of every node in the mesh to a buffer
-local function SaveBlockedStates(mesh: PathMesh): MeshBlockedState
-    local sorted = mesh.SortedNodes
+--Save the current blocked state of every cell in the field to a buffer
+local function SaveBlockedStates(field: Field): FieldBlockedState
+    local sorted = field.SortedCells
     local state = buffer.create(4 * ((#sorted + 31) // 32))
 
     --Pack the state bits into a number
@@ -461,9 +425,9 @@ local function SaveBlockedStates(mesh: PathMesh): MeshBlockedState
     local bits = 0
     local offset = 0
 
-    for _, node in sorted do
+    for _, cell in sorted do
         value *= 2
-        if node[IDX_BLOCKED] then
+        if cell[IDX_BLOCKED] then
             value += 1
         end
 
@@ -485,12 +449,12 @@ local function SaveBlockedStates(mesh: PathMesh): MeshBlockedState
 
     return state
 end
-PathLib.SaveBlockedStates = SaveBlockedStates
+FlowField.SaveBlockedStates = SaveBlockedStates
 
 
---Restore the blocked state of every node in the mesh from a buffer
-local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState): boolean
-    local sorted = mesh.SortedNodes
+--Restore the blocked state of every cell in the field from a buffer
+local function RestoreBlockedStates(field: Field, state: FieldBlockedState): boolean
+    local sorted = field.SortedCells
     local requiredLength = 4 * ((#sorted + 31) // 32)
     local stateLength = buffer.len(state)
 
@@ -506,7 +470,7 @@ local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState): bo
     local bits = 0
     local offset = 0
 
-    for _, node in sorted do
+    for _, cell in sorted do
         --If no unpacked bits are left, retrieve more from the buffer
         if bits == 0 then
             value = buffer.readu32(state, offset)
@@ -517,122 +481,213 @@ local function RestoreBlockedStates(mesh: PathMesh, state: MeshBlockedState): bo
         --The high bit matches the blocked state
         if value >= 0x80000000 then
             value -= 0x80000000
-            node[IDX_BLOCKED] = true
+            cell[IDX_BLOCKED] = true
         else
-            node[IDX_BLOCKED] = false
+            cell[IDX_BLOCKED] = false
         end
 
         value *= 2
         bits -= 1
     end
 
-    ResetCachesForBlockChange(mesh)
+    ResetCachesForBlockChange(field)
     return true
 end
-PathLib.RestoreBlockedStates = RestoreBlockedStates
+FlowField.RestoreBlockedStates = RestoreBlockedStates
 
 
 --Utility to print warnings for invalid start/finish locations
-local function ValidateNode(label: string, location: Vector3, node: PathNode): boolean
-    if not node then
-        CustomWarn(label, " point of (", location, ") is outside path nodes")
+local function ValidateCell(label: string, location: Vector3, cell: FieldCell): boolean
+    if not cell then
+        CustomWarn(label, " point of (", location, ") is outside field cells")
         return false
-    elseif node[IDX_BLOCKED] then
-        CustomWarn(label, " node at (", location, ") is blocked!")
+    elseif cell[IDX_BLOCKED] then
+        CustomWarn(label, " cell at (", location, ") is blocked!")
         return false
     end
     return true
 end
 
 
---Update the costs so paths can be found from anywhere to any goal
-local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
-    --Finding a path requires a finalized mesh
-    if not mesh.IsFinalized then
-        CustomError(1, "Attempted UpdateMeshCosts without finalizing the mesh.")
+--Update the costs so the field points the way to the goal
+local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
+    --Updating the costs requires a finalized field
+    if not field.IsFinalized then
+        CustomError(1, "Attempted UpdateField without finalizing the field.")
         return false
     end
+    local cells = field.Cells
+
 
     --Reset costs to maximum value
-    for _, node in mesh.Nodes do
-        node[IDX_TOTALCOST] = math.huge
-        node[IDX_NEXTNODE] = nil
-        node[IDX_DIRECTION] = Vector3.zero
+    for _, cell in cells do
+        cell[IDX_TOTALCOST] = math.huge
+        cell[IDX_DIRECTION] = Vector3.zero
     end
 
-    mesh.GoalNodes = table.clone(goalNodes)
+    field.GoalCells = table.clone(goalCells)
 
-    --Do a full expansion of nodes in waves until all unblocked nodes have been assigned the minimum cost to get there
-    local frontWave: {[number]: PathNode} = mesh.FrontWaveTable
-    local nextWave: {[number]: PathNode} = mesh.NextWaveTable
-    local thirdWave: {[number]: PathNode} = mesh.ThirdWaveTable
+    --Do a full expansion of cells in waves until all unblocked cells have been assigned the minimum cost to get there
+    local frontWave: {[number]: FieldCell} = field.FrontWaveTable
+    local nextWave: {[number]: FieldCell} = field.NextWaveTable
 
-    for _, goalNode in goalNodes do
-        frontWave[goalNode[IDX_INDEX]] = goalNode
-        goalNode[IDX_TOTALCOST] = 0
-        --Goal nodes point to themselves for simplicity
-        goalNode[IDX_NEXTNODE] = goalNode
+    table.clear(frontWave)
+    table.clear(nextWave)
+
+    for _, goalCell in goalCells do
+        frontWave[goalCell[IDX_INDEX]] = goalCell
+        goalCell[IDX_TOTALCOST] = 0
+    end
+
+    for index, currentCell in frontWave do
+        if currentCell[IDX_TOTALCOST] == math.huge then
+            warn("Visiting unexplored cell!?", currentCell[IDX_POSITION], ";", currentCell)
+        end
     end
 
     local blockedDirections: {Vector3} = table.create(3)
+    local parentDirections: {Vector3} = table.create(3)
+    local parentCenters: {Vector3} = table.create(3)
     while next(frontWave) do
-        for index, currentNode in frontWave do
-            local totalCost = currentNode[IDX_TOTALCOST] + 1
-            local position = currentNode[IDX_POSITION]
-            local centerPoint = Vector3.zero
+        for index, currentCell in frontWave do
+            local totalCost = currentCell[IDX_TOTALCOST] + 1
+            local position: Vector3 = currentCell[IDX_POSITION]
+            local centerPoint: Vector3 = Vector3.zero
             local numCenters = 0
 
+            if currentCell[IDX_TOTALCOST] == math.huge then
+                warn("Visiting unexplored cell!?", currentCell[IDX_POSITION], ";", currentCell)
+            end
+
             --Process each neighbor
-            for _, neighbor in currentNode[IDX_NEIGHBORS] do
+            for _, neighbor in currentCell[IDX_NEIGHBORS] do
                 local blocked = neighbor[IDX_BLOCKED]
                 local neighborIndex = neighbor[IDX_INDEX]
 
                 if blocked then
-                    --Info about blocked neighbors is needed to make sure this node doesn't point that way
-                    local delta = (neighbor[IDX_POSITION] - position).Unit
-                    table.insert(blockedDirections, delta)
-                elseif (totalCost < neighbor[IDX_TOTALCOST]) then
+                    --local blockedCost = totalCost + 2^24
+                    --if cells[neighborIndex] and (blockedCost < neighbor[IDX_TOTALCOST]) then
+                    --    --Neighbors whose costs can be lowered need to be explored
+                    --    neighbor[IDX_TOTALCOST] = blockedCost
+                    --    nextWave[neighborIndex] = neighbor
+                    --end
+                elseif cells[neighborIndex] and (totalCost < neighbor[IDX_TOTALCOST]) then
                     --Neighbors whose costs can be lowered need to be explored
                     neighbor[IDX_TOTALCOST] = totalCost
                     nextWave[neighborIndex] = neighbor
-                else
-                    --Use previously-explored neighbors to decide the direction things should go from here
-                    local parent = thirdWave[neighborIndex]
-                    if parent ~= nil then
-                        local neighborDirection = neighbor[IDX_DIRECTION]
-                        numCenters += 1
-                        centerPoint += neighbor[IDX_POSITION] + neighborDirection
-                    end
                 end
             end
-            --If we have a center position our direction should point to that isn't zero, handle it
-            if (numCenters > 0) and not centerPoint:FuzzyEq(Vector3.zero) then
-                centerPoint /= numCenters
-                local direction = centerPoint - position
-                if #blockedDirections > 0 then
-                    local originalMagnitude = direction.Magnitude
-                    --For each neighbor that was blocked, do a vector rejection if node direction is heading that way
-                    for _, rejection in blockedDirections do
-                        local scalarProjection = direction:Dot(rejection) / rejection:Dot(rejection)
-                        if scalarProjection > 0 then
-                            direction -= scalarProjection * rejection
-                        end
-                    end
-                    --Adjust the magnitude so it properly blends with other node directions later on
-                    direction = direction.Unit * originalMagnitude
-                end
-                currentNode[IDX_DIRECTION] = direction
-            end
-            table.clear(blockedDirections)
         end
-        frontWave, nextWave, thirdWave = nextWave, thirdWave, frontWave
+        frontWave, nextWave = nextWave, frontWave
         table.clear(nextWave)
     end
+
+    local sortedCells = table.clone(field.SortedCells)
+    table.sort(sortedCells, function(a,b) return a[IDX_TOTALCOST] < b[IDX_TOTALCOST] end)
+
+    for _, currentCell in sortedCells do
+        local index = currentCell[IDX_INDEX]
+        local myCost = currentCell[IDX_TOTALCOST]
+        local totalCost = currentCell[IDX_TOTALCOST] + 1
+        local position: Vector3 = currentCell[IDX_POSITION]
+        local centerPoint: Vector3 = Vector3.zero
+        local numCenters = 0
+
+
+        for _, neighbor in currentCell[IDX_NEIGHBORS] do
+            local blocked = neighbor[IDX_BLOCKED]
+            local neighborIndex = neighbor[IDX_INDEX]
+
+            if blocked then
+                ----Info about blocked neighbors is needed to make sure this cell doesn't point that way
+                local delta = (neighbor[IDX_POSITION] - position).Unit
+                table.insert(blockedDirections, delta)
+            elseif (myCost > neighbor[IDX_TOTALCOST]) then
+                --Use previously-explored neighbors to decide the direction things should go from here
+                local neighborDirection = neighbor[IDX_DIRECTION]
+                local center = neighbor[IDX_POSITION] + neighborDirection
+                numCenters += 1
+                centerPoint += center
+                table.insert(parentDirections, neighborDirection)
+                table.insert(parentCenters, center)
+            end
+        end
+        --If we have a center position our direction should point to that isn't zero, handle it
+        if (numCenters > 0) and centerPoint ~= Vector3.zero then
+            centerPoint /= numCenters
+            local direction: Vector3 = centerPoint - position
+            if #blockedDirections > 0 then
+                local originalMagnitude = direction.Magnitude
+                --For each neighbor that was blocked, do a vector rejection if cell direction is heading that way
+                for _, rejection in blockedDirections do
+                    local scalarProjection = direction:Dot(rejection) / rejection:Dot(rejection)
+                    if scalarProjection > 0 then
+                        direction -= scalarProjection * rejection
+                    end
+                end
+                --Adjust the magnitude so it properly blends with other cell directions later on
+                if direction ~= Vector3.zero then
+                    direction = direction.Unit * originalMagnitude
+                end
+            end
+            if #parentDirections == 1 then
+                if (math.abs(direction:Dot(parentDirections[1])) < 10^-10) then
+                    direction = direction.Unit * math.min(direction.Magnitude, GRID_COORD_SPACING * 1)
+                end
+            elseif #parentDirections == 2 then
+                local originalMagnitude = direction.Magnitude
+                if (math.abs(parentDirections[1]:Dot(parentDirections[2])) < 10^-10) and (parentDirections[1].Magnitude + parentDirections[2].Magnitude) > 0 then
+                    local bestDist1 = math.huge
+                    local bestDist2 = math.huge
+                    for _, goalCell in goalCells do
+                        local goalPos = goalCell[IDX_POSITION]
+                        bestDist1 = math.min(bestDist1, (goalPos - parentCenters[1]).Magnitude)
+                        bestDist2 = math.min(bestDist2, (goalPos - parentCenters[2]).Magnitude)
+                    end
+                    if bestDist1 < bestDist2 then
+                        direction = (parentCenters[1] - position).Unit * originalMagnitude
+                        if direction == Vector3.zero then
+                            direction = parentDirections[1]
+                        end
+                    else
+                        direction = (parentCenters[2] - position).Unit * originalMagnitude
+                        if direction == Vector3.zero then
+                            direction = parentDirections[2]
+                        end
+                    end
+                end
+            end
+            currentCell[IDX_DIRECTION] = direction --.Unit * math.min(direction.Magnitude, GRID_COORD_SPACING * 33)
+        end
+
+        table.clear(blockedDirections)
+        table.clear(parentDirections)
+        table.clear(parentCenters)
+    end
+
     --Normalize all the directions now that they're computed
-    for index, node in mesh.Nodes do
-        local direction = node[IDX_DIRECTION]
+    for index, cell in cells do
+        local direction = cell[IDX_DIRECTION]
         if not direction:FuzzyEq(Vector3.zero) then
-            node[IDX_DIRECTION] = direction.Unit
+            cell[IDX_DIRECTION] = direction.Unit * GRID_COORD_SPACING
+        end
+        --if cell[IDX_BLOCKED] then
+        --    cell[IDX_TOTALCOST] = math.huge
+        --end
+        if direction:FuzzyEq(Vector3.zero) and not field.BorderCells[index] and not table.find(goalCells, cell) then
+            local blockCount = 0
+            local neighbors = cell[IDX_NEIGHBORS]
+            for _, neighbor in neighbors do
+                blockCount += if neighbor[IDX_BLOCKED] then 1 else 0
+            end
+            if blockCount < #neighbors then
+                warn("Danger! No direction! ", cell[IDX_POSITION], ";", cell)
+            end
+            direction = (goalCells[1][IDX_POSITION] - cell[IDX_POSITION]).Unit * GRID_COORD_SPACING
+            cell[IDX_DIRECTION] = direction
+        end
+        if (direction.X ~= direction.X) or (direction.Z ~= direction.Z) then
+            warn("Cell with NaN direction!", cell[IDX_POSITION], ";", cell)
         end
     end
 
@@ -640,114 +695,36 @@ local function UpdateMeshCosts(mesh: PathMesh, goalNodes: {PathNode}): boolean
 end
 
 
---Update the costs so paths can be found from anywhere to any of the goals
-function PathLib.UpdateMeshCosts(mesh: PathMesh, goals: {Vector3}): boolean
-    local goalNodes: {PathNode} = table.create(#goals)
+--Update the costs so the field points the way to the goal
+function FlowField.UpdateField(field: Field, goals: {Vector3}): boolean
+    local goalCells: {FieldCell} = table.create(#goals)
     for i, goal in goals do
-        local goalNodePos = ToPathGridRound(goal)
-        local goalNode = mesh.Nodes[CoordToIndex(goalNodePos.X, goalNodePos.Z)]
+        local goalCellPos = ToCellGridRound(goal)
+        local goalCell = field.Cells[CoordToIndex(goalCellPos.X, goalCellPos.Z)]
 
-        if not ValidateNode("Goal", goal, goalNode) then
+        if not ValidateCell("Goal", goal, goalCell) then
             return false
         end
-        goalNodes[i] = goalNode
+        goalCells[i] = goalCell
     end
 
-    return UpdateMeshCosts(mesh, goalNodes)
-end
-
-
---Find a path from the given start node to any goal node using the already-computed costs
-local function FindPathUsingCosts(mesh: PathMesh, startNode: PathNode): PathList?
-    --Goal nodes are required to calculate the next nodes
-    if not mesh.GoalNodes[1] then
-        CustomError(1, "Attempt to find path before setting goal nodes with UpdateMeshCosts!")
-        return nil
-    end
-
-    --If the start node wasn't visited, no path can exist
-    if startNode[IDX_TOTALCOST] == math.huge then
-        CustomWarn("FindPathUsingCosts with start node (", startNode[IDX_POSITION], ") that is unreachable")
-        return nil
-    end
-
-    --Follow the cheapest nodes from start finish
-    --Note that since start has a valid TotalCost, it was visited so a path exists
-    --That means this code doesn't need to check for blocked or unvisited neighbors because better ones will exist
-    local path = {startNode}
-    local pathLen = 1
-    local currentNode = startNode
-    while currentNode[IDX_TOTALCOST] ~= 0 do
-        local bestNeighbor: PathNode? = currentNode[IDX_NEXTNODE]
-
-        if not bestNeighbor then
-            local bestCost = math.huge
-
-            --If the node isn't blocked and was visited, it's reachable so has at least one good neighbor
-            for _, neighbor in currentNode[IDX_NEIGHBORS] do
-                local neighborCost: number = neighbor[IDX_TOTALCOST]
-                if neighborCost < bestCost then
-                    bestNeighbor = neighbor
-                    bestCost = neighborCost
-                end
-            end
-            currentNode[IDX_NEXTNODE] = bestNeighbor
-        end
-
-        --If a valid neighbor isn't found, no reason to keep searching (should never happen)
-        if not bestNeighbor then
-            local goals = {}
-            for _, node in mesh.GoalNodes do
-                table.insert(goals, "(" .. tostring(node[IDX_POSITION]) .. ")")
-            end
-            CustomError(1, "FindPathUsingCosts failed to find path between reachable nodes! Start (", startNode[IDX_POSITION], ") to Goals {", table.concat(goals, ", "), "}")
-            return nil
-        end
-        --Record the neighbor
-        pathLen += 1
-        path[pathLen] = bestNeighbor
-        currentNode = bestNeighbor
-    end
-
-    --Store the position of each node used in the correct (reversed, so start to finish) order
-    local result: PathList = table.create(pathLen)
-
-    for i, node in path do
-        result[i] = node[IDX_POSITION]
-    end
-
-    return result
-end
-
-
---Find a path between the given locations using the already-computed costs
-function PathLib.FindPathUsingCosts(mesh: PathMesh, start: Vector3): PathList?
-    --Look up the start and finish locations in the node grid
-    local startNodePos = ToPathGridRound(start)
-
-    local startNode = mesh.Nodes[CoordToIndex(startNodePos.X, startNodePos.Z)]
-
-    if not ValidateNode("Start", start, startNode) then
-        return nil
-    end
-
-    return FindPathUsingCosts(mesh, startNode)
+    return UpdateField(field, goalCells)
 end
 
 
 --[[
-    Calculate whether a line between two points includes only unblocked nodes.
-    NOTE: The points need not be aligned to the pathing grid!
-    Returns false iff the line crosses any grid coordinate with no node or a node marked blocked.
+    Calculate whether a line between two points includes only unblocked cells.
+    NOTE: The points need not be aligned to the field grid!
+    Returns false iff the line crosses any grid coordinate with no cell or a cell marked blocked.
 
     Based on "A Fast Voxel Traversal Algorithm for Ray Tracing" by John Amanatides and Andrew Woo
-    Extended to be a kind of "circle cast" against the path grid by tracing two lines.
+    Extended to be a kind of "circle cast" against the field grid by tracing two lines.
 --]]
-local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
-    --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or nodes might be missed
+local function IsLineTraversableUncached(field: Field, start: Vector3, finish: Vector3): boolean
+    --Radius can't exceed (or maybe equal?) GRID_COORD_SPACING/2 or cells might be missed
     local radius = (GRID_COORD_SPACING / 2) - (2^-16)
-    local nodes = mesh.Nodes
-    local node: PathNode
+    local cells = field.Cells
+    local cell: FieldCell
 
     local startX = start.X
     local startZ = start.Z
@@ -771,10 +748,10 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     local pBX = startX - rduZ --And the other perpendicular slope to (X, Z) is (-Z, X)
     local pBZ = startZ + rduX
     --Those coordinates snapped to the grid
-    local pAXGrid = ToPathGridRoundSingle(pAX)
-    local pAZGrid = ToPathGridRoundSingle(pAZ)
-    local pBXGrid = ToPathGridRoundSingle(pBX)
-    local pBZGrid = ToPathGridRoundSingle(pBZ)
+    local pAXGrid = ToCellGridRoundSingle(pAX)
+    local pAZGrid = ToCellGridRoundSingle(pAZ)
+    local pBXGrid = ToCellGridRoundSingle(pBX)
+    local pBZGrid = ToCellGridRoundSingle(pBZ)
 
     local index = CoordToIndex(pAXGrid, pAZGrid)
 
@@ -782,13 +759,13 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     if deltaX == 0 then
         --For the loop count the Z endpoint is needed
         local pAEndZ = finish.Z - rduX
-        local pAEndZGrid = ToPathGridRoundSingle(pAEndZ)
+        local pAEndZGrid = ToCellGridRoundSingle(pAEndZ)
 
         --If the two lines representing the circle are in the same cell, only check one cell along the way
         if pAXGrid == pBXGrid then
             for zz = pAZGrid, pAEndZGrid, stepZ do
-                node = nodes[index]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index]
+                if not cell or cell[IDX_BLOCKED] then
                     return false
                 end
                 index += offsetZ
@@ -803,12 +780,12 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
             end
 
             for zz = pAZGrid, pAEndZGrid, stepZ do
-                node = nodes[index]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index]
+                if not cell or cell[IDX_BLOCKED] then
                     return false
                 end
-                node = nodes[index + indexDelta]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index + indexDelta]
+                if not cell or cell[IDX_BLOCKED] then
 
                     return false
                 end
@@ -820,13 +797,13 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     elseif deltaZ == 0 then
         --For the loop count the X endpoint is needed
         local pAEndX = finish.X + rduZ
-        local pAEndXGrid = ToPathGridRoundSingle(pAEndX)
+        local pAEndXGrid = ToCellGridRoundSingle(pAEndX)
 
         --If the two lines representing the circle are in the same cell, only check one cell along the way
         if pAZGrid == pBZGrid then
             for xx = pAXGrid, pAEndXGrid, stepX do
-                node = nodes[index]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index]
+                if not cell or cell[IDX_BLOCKED] then
                     return false
                 end
                 index += offsetX
@@ -841,12 +818,12 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
             end
 
             for xx = pAXGrid, pAEndXGrid, stepX do
-                node = nodes[index]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index]
+                if not cell or cell[IDX_BLOCKED] then
                     return false
                 end
-                node = nodes[index + indexDelta]
-                if not node or node[IDX_BLOCKED] then
+                cell = cells[index + indexDelta]
+                if not cell or cell[IDX_BLOCKED] then
                     return false
                 end
                 index += offsetX
@@ -868,10 +845,10 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
     local tDeltaX = stepX / deltaX
     local tDeltaZ = stepZ / deltaZ
 
-    --Step line A between X and Z grid crossings, checking each node along the path
+    --Step line A between X and Z grid crossings, checking each cell along the field
     while (tMaxXA < 1) or (tMaxZA < 1) do
-        node = nodes[index]
-        if not node or node[IDX_BLOCKED] then
+        cell = cells[index]
+        if not cell or cell[IDX_BLOCKED] then
             return false
         end
         --Advance to the next nearest grid crossing, whether in X or Z direction
@@ -884,17 +861,17 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
         end
     end
 
-    --Check the final node that line A hits
-    node = nodes[index]
-    if not node or node[IDX_BLOCKED] then
+    --Check the final cell that line A hits
+    cell = cells[index]
+    if not cell or cell[IDX_BLOCKED] then
         return false
     end
 
-    --Step line B between X and Z grid crossings, checking each node along the path
+    --Step line B between X and Z grid crossings, checking each cell along the field
     index = CoordToIndex(pBXGrid, pBZGrid)
     while (tMaxXB < 1) or (tMaxZB < 1) do
-        node = nodes[index]
-        if not node or node[IDX_BLOCKED] then
+        cell = cells[index]
+        if not cell or cell[IDX_BLOCKED] then
             return false
         end
         --Advance to the next nearest grid crossing, whether in X or Z direction
@@ -907,27 +884,27 @@ local function IsLineTraversableUncached(mesh: PathMesh, start: Vector3, finish:
         end
     end
 
-    --Check the final node that line B hits
-    node = nodes[index]
-    if not node or node[IDX_BLOCKED] then
+    --Check the final cell that line B hits
+    cell = cells[index]
+    if not cell or cell[IDX_BLOCKED] then
         return false
     end
 
     return true
 end
-PathLib.IsLineTraversableUncached = IsLineTraversableUncached
+FlowField.IsLineTraversableUncached = IsLineTraversableUncached
 
 
 --Wrapper of IsLineTraversable that uses a cache for grid-aligned queries
-local function IsLineTraversableCached(mesh: PathMesh, start: Vector3, finish: Vector3): boolean
+local function IsLineTraversableCached(field: Field, start: Vector3, finish: Vector3): boolean
     if not IsOnPathGrid(start) or not IsOnPathGrid(finish) then
-        return IsLineTraversableUncached(mesh, start, finish)
+        return IsLineTraversableUncached(field, start, finish)
     end
 
     local startIndex = CoordToIndex(start.X, start.Z)
     local finishIndex = CoordToIndex(finish.X, finish.Z)
 
-    local lineCache = mesh.LineCache
+    local lineCache = field.LineCache
     local index = CombineIndexesIntoLine(startIndex, finishIndex)
 
     local value = lineCache[index]
@@ -935,16 +912,16 @@ local function IsLineTraversableCached(mesh: PathMesh, start: Vector3, finish: V
         return value
     end
 
-    value = IsLineTraversableUncached(mesh, start, finish)
+    value = IsLineTraversableUncached(field, start, finish)
     lineCache[index] = value
     return value
 end
-PathLib.IsLineTraversable = IsLineTraversableCached
+FlowField.IsLineTraversable = IsLineTraversableCached
 
 
---Calculate whether a rectangle between two points includes only unblocked nodes.
-function PathLib.IsAreaUnblocked(mesh: PathMesh, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): boolean
-    local nodes = mesh.Nodes
+--Calculate whether a rectangle between two points includes only unblocked cells.
+function FlowField.IsAreaUnblocked(field: Field, minCorner: Vector3, maxCorner: Vector3, includePartial: boolean?): boolean
+    local cells = field.Cells
 
     minCorner, maxCorner = AlignAreaToGrid(minCorner, maxCorner, includePartial)
     local minCornerX = minCorner.X
@@ -954,9 +931,9 @@ function PathLib.IsAreaUnblocked(mesh: PathMesh, minCorner: Vector3, maxCorner: 
         local index = CoordToIndex(minCornerX, z)
 
         for x = minCornerX, maxCornerX, GRID_COORD_SPACING do
-            local node = nodes[index]
+            local cell = cells[index]
 
-            if not node or node[IDX_BLOCKED] then
+            if not cell or cell[IDX_BLOCKED] then
                 return false
             end
 
@@ -969,218 +946,21 @@ end
 
 
 --Calculate whether a point is reachable from any goal point used to calculate costs
-function PathLib.IsPointReachable(mesh: PathMesh, point: Vector3): boolean
-    local nodePos = ToPathGridRound(point)
-    local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
+function FlowField.IsPointReachable(field: Field, point: Vector3): boolean
+    local cellPos = ToCellGridRound(point)
+    local cell = field.Cells[CoordToIndex(cellPos.X, cellPos.Z)]
 
-    return node and not node[IDX_BLOCKED] and (node[IDX_TOTALCOST] ~= math.huge)
+    return cell and not cell[IDX_BLOCKED] and (cell[IDX_TOTALCOST] ~= math.huge)
 end
 
 
 --Calculate whether a point has an obstacle covering it
-function PathLib.IsPointBlocked(mesh: PathMesh, point: Vector3): boolean
-    local nodePos = ToPathGridRound(point)
-    local node = mesh.Nodes[CoordToIndex(nodePos.X, nodePos.Z)]
+function FlowField.IsPointBlocked(field: Field, point: Vector3): boolean
+    local cellPos = ToCellGridRound(point)
+    local cell = field.Cells[CoordToIndex(cellPos.X, cellPos.Z)]
 
-    return node and node[IDX_BLOCKED]
+    return cell and cell[IDX_BLOCKED]
 end
 
 
---Search in both directions along a path to see if straight-line movement can eliminate intermediate nodes
-local function TrySimplifyCorner(mesh: PathMesh, path: PathList, cornerIndex: number, minStart: number): (number, number)
-    local pathLen = #path
-    local prevIndex = cornerIndex
-    local nextIndex = cornerIndex
-    local prevPosition
-    local nextPosition
-
-    --March both directions (towards start and finish of path) simultaneously as far as it's unblocked
-    while (prevIndex > minStart) and (nextIndex < pathLen) do
-        prevIndex -= 1
-        nextIndex += 1
-        prevPosition = path[prevIndex]
-        nextPosition = path[nextIndex]
-        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
-            prevIndex += 1
-            nextIndex -= 1
-            break
-        end
-    end
-    if prevIndex == nextIndex then
-        --The corner couldn't be eliminated,
-        return cornerIndex, cornerIndex
-    end
-    prevPosition = path[prevIndex]
-    nextPosition = path[nextIndex]
-
-    --The previous loop changed prevIndex and neext, so the corner node can be eliminated
-    --check whether even more nodes can be eliminated in either direction
-
-    --March nextIndex point forwards (towards finish) as far as it's unblocked
-    local startN = nextIndex
-    nextIndex = pathLen
-    for i = startN + 1, pathLen do
-        nextPosition = path[i]
-        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
-            nextIndex = i - 1
-            nextPosition = path[nextIndex]
-            break
-        end
-    end
-
-    ----March previous point backwards (towards start) as far as it's unblocked
-    local startP = prevIndex
-    prevIndex = minStart
-    for i = startP - 1, minStart, -1 do
-        prevPosition = path[i]
-        if not IsLineTraversableCached(mesh, prevPosition, nextPosition) then
-            prevIndex = i + 1
-            --prevPosition = path[prevIndex]
-            break
-        end
-    end
-
-    --Return the two nodes that must be kept - everything between them can be eliminated
-    return prevIndex, nextIndex
-end
-
-
---Copy nodes to the simplified path while reducing runs of nodes in a line to just the endpoints
-local function SimplifyCopyNodes(path: PathList, first: number, last: number, simplified: PathList)
-    local i = first
-    while i < last do
-        local currentPosition = path[i]
-        local currentPositionX = currentPosition.X
-        local currentPositionZ = currentPosition.Z
-        local nextIndex = i + 1
-
-        table.insert(simplified, currentPosition)
-
-        if currentPositionX == path[nextIndex].X then
-            --Advance through intermediate nodes in the straight X line
-            while (nextIndex < last) and (currentPositionX == path[nextIndex + 1].X) do
-                nextIndex += 1
-            end
-
-        elseif currentPositionZ == path[nextIndex].Z then
-            --Advance through intermediate nodes in the straight Z line
-            while (nextIndex < last) and (currentPositionZ == path[nextIndex + 1].Z) do
-                nextIndex += 1
-            end
-        end
-        i = nextIndex
-    end
-
-    if last >= first then
-        table.insert(simplified, path[last])
-    end
-end
-
-
---Eliminate nodes that can be bypassed with straight-line movement
-local function SimplifyPass2(mesh: PathMesh, path: PathList): PathList
-    local pathLen = #path
-    local extraSimplePath = {}
-    local i = 1
-
-    while i < pathLen do
-        local currNode = path[i]
-        table.insert(extraSimplePath, currNode)
-
-        --Trace as far ahead as can be reached by a straight line
-        local reachableIndex = i + 2
-        while (reachableIndex <= pathLen) and IsLineTraversableCached(mesh, currNode, path[reachableIndex]) do
-            reachableIndex += 1
-        end
-        reachableIndex -= 1
-        i = reachableIndex
-    end
-    table.insert(extraSimplePath, path[pathLen])
-    return extraSimplePath
-end
-
-
---[[
-Simplify the path by using straight lines to skip nodes where possible.
-The resulting path may not closely follow the original path, but only traverses unblocked nodes.
---]]
-function PathLib.SimplifyPath(mesh: PathMesh, path: PathList): PathList
-    --Remove corner nodes that can be bypassed by diagonal straight line movement
-    --These corners are typically in open space and just a limitation of 4-direction movement
-    --Also reduce runs of nodes in a line to just the nodes on the ends
-    local simplifyCache = mesh.SimplifyCache
-    local simplePath = {}
-    local pathLen = #path
-    local lastFixedNode = 1
-    local useCache = false
-
-    do
-        local i = 2
-        while i < pathLen do
-            local currentPosition = path[i]
-            local currentPositionX = currentPosition.X
-
-            --If this position is in the cache, the rest of the simplified path is known
-            if simplifyCache[currentPosition] then
-                --Copy nodes up to this point to the simplified path
-                SimplifyCopyNodes(path, lastFixedNode, i, simplePath)
-                useCache = true
-                break
-            end
-
-            --Adjecent positions match in X or Z. If how 3 consecutive nodes match differs, it's a corner
-            if (path[i - 1].X == currentPositionX) ~= (currentPositionX == path[i + 1].X) then
-                local prevIndex, nextIndex = TrySimplifyCorner(mesh, path, i, lastFixedNode)
-
-                if prevIndex + 1 < nextIndex then
-                    SimplifyCopyNodes(path, lastFixedNode, prevIndex, simplePath)
-                    lastFixedNode = nextIndex
-                    i = nextIndex - 1 --i gets incremented below, so we continue at i=n
-                end
-            end
-            i += 1
-        end
-    end
-
-    --Copy remaining nodes on the path if the cache doesn't complete the path
-    if not useCache then
-        SimplifyCopyNodes(path, lastFixedNode, pathLen, simplePath)
-    end
-
-    --Put the path so far into the cache (before the rest is copied from the cache)
-    local prevNode = simplePath[1]
-    local simplePathLen = #simplePath
-    for i = 2, simplePathLen do
-        local currentPosition = simplePath[i]
-        simplifyCache[prevNode] = currentPosition
-        prevNode = currentPosition
-    end
-
-    --If the next point is in the cache, follow the cache to the goal
-    if useCache then
-        local nextPosition = simplifyCache[simplePath[simplePathLen]]
-        while nextPosition do
-            simplePathLen += 1
-            simplePath[simplePathLen] = nextPosition
-            nextPosition = simplifyCache[nextPosition]
-        end
-    end
-
-    --Perform a second simplification pass that reduces the number of nodes in many cases
-    local extraSimplePath = SimplifyPass2(mesh, simplePath)
-    local extrasSimplePathLen = #extraSimplePath
-    if extrasSimplePathLen < simplePathLen then
-        --If the second pass improved the simplification, update the cache
-        prevNode = extraSimplePath[1]
-        for i = 2, extrasSimplePathLen do
-            local currentPosition = extraSimplePath[i]
-            simplifyCache[prevNode] = currentPosition
-            prevNode = currentPosition
-        end
-    end
-
-    return extraSimplePath
-end
-
-
-return table.freeze(PathLib)
+return table.freeze(FlowField)
