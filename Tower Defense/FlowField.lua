@@ -21,18 +21,24 @@ local IDX_INDEX = 3
 local IDX_TOTALCOST = 4
 local IDX_BLOCKED = 5
 local IDX_DIRECTION = 6
+local IDX_WAVENUMBER = 7
 
 type FieldCell = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --{Neighbors: {FieldCell}, Position: Vector3, Index: number, TotalCost: number, Blocked: boolean, Direction: Vector3}
+type FieldUpdateCache = {
+    FrontWaveTable: {[number]: FieldCell},
+    NextWaveTable: {[number]: FieldCell},
+    FutureWaveTable: {[number]: FieldCell},
+}
+
 export type Field = {
     Cells: {[number]: FieldCell},
     SortedCells: {FieldCell},
     BorderCells: {[number]: FieldCell},
     IsFinalized: boolean,
     GoalCells: {FieldCell},
+    UpdateCache: FieldUpdateCache,
     LineCache: {[number]: boolean},
-    FrontWaveTable: {[number]: FieldCell},
-    NextWaveTable: {[number]: FieldCell},
 
 }
 export type FieldBlockedState = buffer
@@ -191,9 +197,12 @@ function FlowField.NewField(): Field
         BorderCells = {},
         IsFinalized = false,
         GoalCells = {},
+        UpdateCache = {
+            FrontWaveTable = {},
+            NextWaveTable = {},
+            FutureWaveTable = {},
+        },
         LineCache = {},
-        FrontWaveTable = {},
-        NextWaveTable = {},
     }
 end
 
@@ -207,9 +216,12 @@ function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
         BorderCells = {},
         IsFinalized = false,
         GoalCells = table.create(#oldField.GoalCells),
+        UpdateCache = {
+            FrontWaveTable = {},
+            NextWaveTable = {},
+            FutureWaveTable = {},
+        },
         LineCache = {},
-        FrontWaveTable = {},
-        NextWaveTable = {},
     }
     local oldCells = oldField.Cells
     local oldSorted = oldField.SortedCells
@@ -234,13 +246,13 @@ function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
         local newBorderCells = oldField.BorderCells
         newField.BorderCells = newBorderCells
         --Connect each cell to its 4-way neighbors
-        for index, newCell in newCells do
+        for cellIndex, newCell in newCells do
             local newNeighbors: {FieldCell} = newCell[IDX_NEIGHBORS]
-            local oldNeighbors: {FieldCell} = oldCells[index][IDX_NEIGHBORS]
+            local oldNeighbors: {FieldCell} = oldCells[cellIndex][IDX_NEIGHBORS]
 
             for i, neighbor in oldNeighbors do
-                local index = neighbor[IDX_INDEX]
-                newNeighbors[i] = newCells[index] or newBorderCells[index]
+                local neighborIndex = neighbor[IDX_INDEX]
+                newNeighbors[i] = newCells[neighborIndex] or newBorderCells[neighborIndex]
             end
 
             table.freeze(newNeighbors)
@@ -270,12 +282,13 @@ function FlowField.AddArea(field: Field, minCorner: Vector3, maxCorner: Vector3,
         for x = minCornerX, maxCornerX, GRID_COORD_SPACING do
             if not cells[index] then
                 local cell: FieldCell = {
-                    table.create(4),               --Neighbors
-                    Vector3.new(x, 0, z),          --Position
-                    index,                         --Index
-                    math.huge,                     --TotalCost
-                    false,                         --Blocked
-                    Vector3.zero,                  --Direction
+                    table.create(4),       --Neighbors
+                    Vector3.new(x, 0, z),  --Position
+                    index,                 --Index
+                    math.huge,             --TotalCost
+                    false,                 --Blocked
+                    Vector3.zero,          --Direction
+                    math.huge,             --WaveNumber
                 }
                 cells[index] = cell
                 table.insert(sorted, cell)
@@ -296,6 +309,7 @@ local function MakeBorderCell(neighborIndex: number, borderPosition: Vector3): F
         math.huge,            --TotalCost
         true,                 --Blocked
         Vector3.zero,         --Direction
+        math.huge,            --WaveNumber
         borderCellStr --extra to make them obvious
     } :: FieldCell)
 end
@@ -510,6 +524,7 @@ end
 
 local COSINE_60 = 0.5
 local COSINE_30 = 0.86602540378443864676372317075294
+local EXTRA_BLOCKED_COST = 2^24
 
 local function RejectBadDirection(direction: Vector3, badDirection: Vector3): Vector3
     local originalMagnitude = direction.Magnitude
@@ -539,137 +554,161 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
     for _, cell in cells do
         cell[IDX_TOTALCOST] = math.huge
         cell[IDX_DIRECTION] = Vector3.zero
+        cell[IDX_WAVENUMBER] = math.huge
     end
 
     field.GoalCells = table.clone(goalCells)
 
     --Do a full expansion of cells in waves until all unblocked cells have been assigned the minimum cost to get there
-    local frontWave: {[number]: FieldCell} = field.FrontWaveTable
-    local nextWave: {[number]: FieldCell} = field.NextWaveTable
+    local frontWave = field.UpdateCache.FrontWaveTable
+    local nextWave = field.UpdateCache.NextWaveTable
+    local futureWave = field.UpdateCache.FutureWaveTable
 
     table.clear(frontWave)
     table.clear(nextWave)
+    table.clear(futureWave)
 
-    local waveNumberDict: {[FieldCell]: number} = {}
-    local currentWaveNumber = 0
+    local currentWaveNumber = 1
 
     for _, goalCell in goalCells do
         frontWave[goalCell[IDX_INDEX]] = goalCell
         goalCell[IDX_TOTALCOST] = 0
-        waveNumberDict[goalCell] = currentWaveNumber
+        goalCell[IDX_WAVENUMBER] = currentWaveNumber
     end
 
-    for index, currentCell in frontWave do
-        if currentCell[IDX_TOTALCOST] == math.huge then
-            warn("Visiting unexplored cell!?", currentCell[IDX_POSITION], ";", currentCell)
+    repeat
+        while next(frontWave) do
+            currentWaveNumber += 1
+            for myIndex, currentCell in frontWave do
+                local totalCost = currentCell[IDX_TOTALCOST] + 1
+                local myIsBlocked: boolean = currentCell[IDX_BLOCKED]
+
+                currentCell[IDX_WAVENUMBER] = currentWaveNumber
+
+                --Process each neighbor
+                for _, neighbor in currentCell[IDX_NEIGHBORS] do
+                    local neighborIsBlocked = neighbor[IDX_BLOCKED]
+                    local neighborIndex = neighbor[IDX_INDEX]
+
+                    if neighborIsBlocked then
+                        local blockedCost = totalCost + EXTRA_BLOCKED_COST
+                        if (blockedCost < neighbor[IDX_TOTALCOST]) and cells[neighborIndex] then
+                            neighbor[IDX_TOTALCOST] = blockedCost
+                            futureWave[neighborIndex] = neighbor
+                        end
+                    elseif (totalCost < neighbor[IDX_TOTALCOST]) then
+                        neighbor[IDX_TOTALCOST] = totalCost
+                        if myIsBlocked then
+                            --Don't allow expanding from blocked->unblocked until the future
+                            futureWave[neighborIndex] = neighbor
+                        else
+                            --Neighbors whose costs can be lowered need to be explored
+                            nextWave[neighborIndex] = neighbor
+                            futureWave[neighborIndex] = nil
+                        end
+                    end
+                end
+            end
+            frontWave, nextWave = nextWave, frontWave
+            table.clear(nextWave)
+        end
+        frontWave, futureWave = futureWave, frontWave
+        table.clear(futureWave)
+    until not next(frontWave)
+
+    local sortedWaves = table.create(currentWaveNumber)
+    for ii = 1, currentWaveNumber do
+        sortedWaves[ii] = {}
+    end
+    for index, cell in cells do
+        local waveNumber = cell[IDX_WAVENUMBER]
+        if waveNumber ~= math.huge then
+            table.insert(sortedWaves[waveNumber], cell)
         end
     end
 
-    while next(frontWave) do
-        currentWaveNumber += 1
-        for index, currentCell in frontWave do
-            local totalCost = currentCell[IDX_TOTALCOST] + 1
-            local position: Vector3 = currentCell[IDX_POSITION]
+    local blockedDirections: {Vector3} = table.create(4)
+    local borderDirections: {Vector3} = table.create(4)
+    local blockedParentPositions: {Vector3} = table.create(4)
+    local parentPositions: {Vector3} = table.create(4)
+    local parentDirections: {Vector3} = table.create(4)
+    local parentCenters: {Vector3} = table.create(4)
+
+    for myWave, currentWave in sortedWaves do
+        table.sort(currentWave, function (a, b) return a[IDX_TOTALCOST] < b[IDX_TOTALCOST] end)
+        for _, currentCell in currentWave do
+            local myCost = currentCell[IDX_TOTALCOST]
+            local myPosition: Vector3 = currentCell[IDX_POSITION]
+            local myIsBlocked: boolean = currentCell[IDX_BLOCKED]
+
             local centerPoint: Vector3 = Vector3.zero
             local numCenters = 0
 
-            if currentCell[IDX_TOTALCOST] == math.huge then
-                warn("Visiting unexplored cell!?", currentCell[IDX_POSITION], ";", currentCell)
-            end
 
-            --Process each neighbor
+            table.clear(blockedDirections)
+            table.clear(borderDirections)
+            table.clear(blockedParentPositions)
+            table.clear(parentDirections)
+            table.clear(parentCenters)
+            table.clear(parentPositions)
             for _, neighbor in currentCell[IDX_NEIGHBORS] do
-                local blocked = neighbor[IDX_BLOCKED]
+                local neighborIsBlocked = neighbor[IDX_BLOCKED]
                 local neighborIndex = neighbor[IDX_INDEX]
-
-                if blocked then
-                    local blockedCost = totalCost + 2^16
-                    if cells[neighborIndex] and (blockedCost < neighbor[IDX_TOTALCOST]) then
-                        --Neighbors whose costs can be lowered need to be explored
-                        neighbor[IDX_TOTALCOST] = blockedCost
-                        nextWave[neighborIndex] = neighbor
-                        waveNumberDict[neighbor] = currentWaveNumber
-                    end
-                elseif (totalCost < neighbor[IDX_TOTALCOST]) then
-                    --Neighbors whose costs can be lowered need to be explored
-                    neighbor[IDX_TOTALCOST] = totalCost
-                    nextWave[neighborIndex] = neighbor
-                    waveNumberDict[neighbor] = currentWaveNumber
-                end
-            end
-        end
-        frontWave, nextWave = nextWave, frontWave
-        table.clear(nextWave)
-    end
-
-    local sortedCells = table.clone(field.SortedCells)
-    --table.sort(sortedCells, function(a,b) return a[IDX_TOTALCOST] < b[IDX_TOTALCOST] end)
-    table.sort(sortedCells, function (a,b) return waveNumberDict[a] < waveNumberDict[b] end)
-
-    local blockedDirections: {Vector3} = table.create(3)
-    local borderDirections: {Vector3} = table.create(3)
-    local parentPositions: {Vector3} = table.create(3)
-    local parentDirections: {Vector3} = table.create(3)
-    local parentCenters: {Vector3} = table.create(3)
-    for _, currentCell in sortedCells do
-        local index = currentCell[IDX_INDEX]
-        local myCost = currentCell[IDX_TOTALCOST]
-        local myWave = waveNumberDict[currentCell]
-        local position: Vector3 = currentCell[IDX_POSITION]
-        local isBlocked: boolean = currentCell[IDX_BLOCKED]
-        local totalCost = currentCell[IDX_TOTALCOST] + 1
-
-        local centerPoint: Vector3 = Vector3.zero
-        local numCenters = 0
-
-
-        table.clear(blockedDirections)
-        table.clear(borderDirections)
-        table.clear(parentDirections)
-        table.clear(parentCenters)
-        table.clear(parentPositions)
-        for _, neighbor in currentCell[IDX_NEIGHBORS] do
-            local blocked = neighbor[IDX_BLOCKED]
-            local neighborIndex = neighbor[IDX_INDEX]
-
-            if blocked then
-                ----Info about blocked neighbors is needed to make sure this cell doesn't point that way
-                local delta = neighbor[IDX_POSITION] - position
-                table.insert(blockedDirections, delta)
-                if borderCells[neighborIndex] then
-                    table.insert(borderDirections, delta)
-                end
-            elseif isBlocked or (myWave > waveNumberDict[neighbor]) or (myCost > neighbor[IDX_TOTALCOST]) then
-                --Use previously-explored neighbors to decide the direction things should go from here
+                local neighborWave = neighbor[IDX_WAVENUMBER]
+                local neighborCost = neighbor[IDX_TOTALCOST]
                 local neighborDirection = neighbor[IDX_DIRECTION]
                 local neighborPosition = neighbor[IDX_POSITION]
                 local center = neighborPosition + neighborDirection
-                numCenters += 1
-                centerPoint += center
-                table.insert(parentDirections, neighborDirection)
-                table.insert(parentCenters, center)
-                table.insert(parentPositions, neighborPosition)
-            end
-        end
 
-        --If we have a center position our direction should point to that isn't zero, handle it
-        if (numCenters > 0) and centerPoint ~= Vector3.zero then
-            centerPoint /= numCenters
-            local direction: Vector3 = centerPoint - position
-            if (not isBlocked) then
-                --For each neighbor that was blocked, do a vector rejection if cell direction is heading that way
-                for _, badDirection in blockedDirections do
-                    direction = RejectBadDirection(direction, badDirection)
+                local isParent = (myWave > neighborWave) or ((myWave == neighborWave) and (myCost > neighborCost))
+
+                if neighborIsBlocked then
+                    ----Info about blocked neighbors is needed to make sure this cell doesn't point that way
+                    local delta = neighbor[IDX_POSITION] - myPosition
+                    if isParent then
+                        table.insert(blockedParentPositions, neighborPosition)
+                    else
+                        table.insert(blockedDirections, delta)
+                    end
+                    if borderCells[neighborIndex] then
+                        table.insert(borderDirections, delta)
+                    end
+                elseif isParent then
+                    --Use previously-explored neighbors to decide the direction things should go from here
+                    if (neighborDirection ~= Vector3.zero) or (neighborCost == 0) then
+                        numCenters += 1
+                        centerPoint += center
+                        table.insert(parentDirections, neighborDirection)
+                        table.insert(parentCenters, center)
+                        table.insert(parentPositions, neighborPosition)
+                    end
+                    --
                 end
             end
-            if isBlocked then
-                local originalMagnitude = direction.Magnitude
-                direction = Vector3.zero
-                for _, parentPos in parentPositions do
-                    direction += (parentPos - position).Unit
+
+            --If we have a center position our direction should point to that isn't zero, handle it
+
+            if myIsBlocked then
+                local direction = Vector3.zero
+                if #parentPositions > 0 then
+                    --Point towards parents
+                    for _, parentPos in parentPositions do
+                        direction += (parentPos - myPosition).Unit
+                    end
+                elseif #blockedParentPositions > 0 then
+                    --Point towards parents
+                    for _, parentPos in blockedParentPositions do
+                        direction += (parentPos - myPosition).Unit
+                    end
+                elseif #blockedDirections > 0 then
+                    --Point away from non-parent blockers
+                    for _, blockedDir in blockedDirections do
+                        direction -= blockedDir
+                    end
                 end
+                --For each blocked non-parent neighbor, do a vector rejection if cell direction is heading that way
                 for _, blockedDir in blockedDirections do
-                    direction -= blockedDir.Unit
+                    direction = RejectBadDirection(direction, blockedDir)
                 end
                 --For each neighbor that was in the border, do a vector rejection if cell direction is heading that way
                 for _, badDirection in borderDirections do
@@ -677,97 +716,124 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                 end
 
                 if direction ~= Vector3.zero then
-                    direction = direction.Unit * originalMagnitude
-                end
-                if direction == Vector3.zero then
+                    direction = direction.Unit
+                else
+                    --If it still doesn't have a direction, make it point towards goals
                     for _, goalCell in goalCells do
-                        direction += (goalCell[IDX_POSITION] - position).Unit
-                    end
-                    for _, badDirection in blockedDirections do
-                        direction = RejectBadDirection(direction, badDirection)
+                        direction += (goalCell[IDX_POSITION] - myPosition).Unit
                     end
                     for _, badDirection in borderDirections do
                         direction = RejectBadDirection(direction, badDirection)
                     end
                     if direction ~= Vector3.zero then
-                        direction += direction.Unit * originalMagnitude
+                        direction += direction.Unit
                     end
                 end
-            elseif #parentDirections == 1 then
-                if (math.abs(direction:Dot(parentDirections[1])) < 10^-10) then
-                    direction = direction.Unit * math.min(direction.Magnitude, GRID_COORD_SPACING * 1)
+                currentCell[IDX_DIRECTION] = direction
+            elseif (numCenters > 0) or (#blockedParentPositions > 0) then
+                local direction: Vector3 = Vector3.zero
+                if numCenters > 0 then
+                    centerPoint /= numCenters
+                    direction = centerPoint - myPosition
                 end
-            elseif #parentDirections == 2 then
-                local originalMagnitude = direction.Magnitude
+                if #blockedParentPositions > 0 then
+                    local originalMagnitude = direction.Magnitude
+                    if direction ~= Vector3.zero then
+                        direction = direction.Unit * numCenters
+                    end
+                    for _, parentPos in blockedParentPositions do
+                        direction += (parentPos - myPosition).Unit
+                    end
+                    if direction ~= Vector3.zero then
+                        direction = direction.Unit * originalMagnitude
+                    end
+                end
+                --For each neighbor that was blocked, do a vector rejection if cell direction is heading that way
+                for _, badDirection in blockedDirections do
+                    direction = RejectBadDirection(direction, badDirection)
+                end
+                if #parentDirections == 1 then
+                    if (math.abs(direction:Dot(parentDirections[1])) < 10^-10) then
+                        direction = direction.Unit * math.min(direction.Magnitude, GRID_COORD_SPACING * 1)
+                    end
+                elseif #parentDirections == 2 then
+                    local originalMagnitude = direction.Magnitude
 
-                local parent1Cos = direction.Unit:Dot(parentDirections[1].Unit)
-                local parent2Cos = direction.Unit:Dot(parentDirections[2].Unit)
-                if (parent1Cos > COSINE_60) and (parent1Cos < COSINE_30)
-                    and (parent2Cos > COSINE_60) and (parent2Cos < COSINE_30)
-                    and (math.abs(parentDirections[1]:Dot(parentDirections[2])) < 10^-6) then
-                    local bestDist1 = math.huge
-                    local bestDist2 = math.huge
-                    for _, goalCell in goalCells do
-                        local goalPos = goalCell[IDX_POSITION]
-                        bestDist1 = math.min(bestDist1, (goalPos - parentCenters[1]).Magnitude)
-                        bestDist2 = math.min(bestDist2, (goalPos - parentCenters[2]).Magnitude)
-                    end
-                    if bestDist1 < bestDist2 then
-                        direction = (parentCenters[1] - position).Unit * originalMagnitude
-                        if direction == Vector3.zero then
-                            direction = parentDirections[1]
+                    local parent1Cos = direction.Unit:Dot(parentDirections[1].Unit)
+                    local parent2Cos = direction.Unit:Dot(parentDirections[2].Unit)
+                    if (parent1Cos > COSINE_60) and (parent1Cos < COSINE_30)
+                        and (parent2Cos > COSINE_60) and (parent2Cos < COSINE_30)
+                        and (math.abs(parentDirections[1].Unit:Dot(parentDirections[2].Unit)) < 10^-6) then
+                        local bestDist1 = math.huge
+                        local bestDist2 = math.huge
+                        for _, goalCell in goalCells do
+                            local goalPos = goalCell[IDX_POSITION]
+                            bestDist1 = math.min(bestDist1, (goalPos - parentCenters[1]).Magnitude)
+                            bestDist2 = math.min(bestDist2, (goalPos - parentCenters[2]).Magnitude)
                         end
-                    else
-                        direction = (parentCenters[2] - position).Unit * originalMagnitude
-                        if direction == Vector3.zero then
-                            direction = parentDirections[2]
+                        if bestDist1 < bestDist2 then
+                            direction = (parentCenters[1] - myPosition).Unit * originalMagnitude
+                            if direction == Vector3.zero then
+                                direction = parentDirections[1].Unit * originalMagnitude
+                            end
+                        else
+                            direction = (parentCenters[2] - myPosition).Unit * originalMagnitude
+                            if direction == Vector3.zero then
+                                direction = parentDirections[2].Unit * originalMagnitude
+                            end
                         end
                     end
-                end
-                if (not isBlocked) then
                     --For each neighbor that was blocked, do a vector rejection if cell direction is heading that way
                     for _, badDirection in blockedDirections do
                         direction = RejectBadDirection(direction, badDirection)
                     end
                 end
+                currentCell[IDX_DIRECTION] = direction
             end
-            currentCell[IDX_DIRECTION] = direction
         end
     end
 
     --Normalize all the directions now that they're computed
     for index, currentCell in cells do
+        local myCost = currentCell[IDX_TOTALCOST]
         local position: Vector3 = currentCell[IDX_POSITION]
         local direction = currentCell[IDX_DIRECTION]
         local isBlocked: boolean = currentCell[IDX_BLOCKED]
 
-        if direction:FuzzyEq(Vector3.zero) and not table.find(goalCells, currentCell) then
-            local blockCount = 0
+        if direction:FuzzyEq(Vector3.zero) and (myCost > 0) then
             local neighbors = currentCell[IDX_NEIGHBORS]
 
             direction = (goalCells[1][IDX_POSITION] - currentCell[IDX_POSITION]).Unit * GRID_COORD_SPACING
+            local bestNeighbor = nil
+            local bestNeighborCost = math.huge
             for _, neighbor in neighbors do
-                local blocked = neighbor[IDX_BLOCKED]
-                blockCount += if blocked then 1 else 0
-
-                local neighborIndex = neighbor[IDX_INDEX]
-
-                if blocked and borderCells[neighborIndex] then
-                    ----Info about blocked neighbors is needed to make sure this cell doesn't point that way
-                    local delta = neighbor[IDX_POSITION] - position
-                    direction = RejectBadDirection(direction, delta)
+                local neighborCost = neighbor[IDX_TOTALCOST]
+                if neighborCost < bestNeighborCost then
+                    bestNeighborCost = neighborCost
+                    bestNeighbor = neighbor
                 end
+                --local blocked = neighbor[IDX_BLOCKED]
+                --blockCount += if blocked then 1 else 0
+
+                --local neighborIndex = neighbor[IDX_INDEX]
+
+                --if blocked and borderCells[neighborIndex] then
+                --    ----Info about blocked neighbors is needed to make sure this cell doesn't point that way
+                --    local delta = neighbor[IDX_POSITION] - position
+                --    direction = RejectBadDirection(direction, delta)
+                --end
             end
-            if blockCount < #neighbors then
-                warn("Danger! No direction! ", currentCell[IDX_POSITION], ";", currentCell, "[", blockCount, "]")
-            end
+            direction = bestNeighbor[IDX_POSITION] - position
+            --if blockCount < #neighbors then
+            --    warn("Danger! No direction! ", currentCell[IDX_POSITION], ";", currentCell, "[", blockCount, "]")
+            --end
         end
         if (direction.X ~= direction.X) or (direction.Z ~= direction.Z) then
             warn("Cell with NaN direction!", currentCell[IDX_POSITION], ";", currentCell)
         end
         if not direction:FuzzyEq(Vector3.zero) then
             if isBlocked then
-                currentCell[IDX_DIRECTION] = 2 * direction.Unit * GRID_COORD_SPACING
+                currentCell[IDX_DIRECTION] = 4 * direction.Unit * GRID_COORD_SPACING
             else
                 currentCell[IDX_DIRECTION] = direction.Unit * GRID_COORD_SPACING
             end
@@ -1048,7 +1114,6 @@ end
 
 --Use bilinear interpolation to get the direction from a particular point
 local function GetDirection(field: Field, position: Vector3): Vector3
-    local center = ToCellGridRound(position)
     local cells = field.Cells
 
     local upperLeft = ToCellGridFloor(position)
@@ -1066,8 +1131,8 @@ local function GetDirection(field: Field, position: Vector3): Vector3
     local ulNode = cells[ulIndex]
     local lrNode = cells[lrIndex]
 
-    local divisor = (lowerRight - upperLeft):Max(Vector3.one)
-    local delta = (position - upperLeft) / divisor
+    local deltaDivisor = (lowerRight - upperLeft):Max(Vector3.one)
+    local delta = (position - upperLeft) / deltaDivisor
 
     local direction = Vector3.zero
     local divisor = 0
