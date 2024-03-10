@@ -1269,14 +1269,24 @@ local function GetDirection(field: Field, position: Vector3): Vector3
     if direction == Vector3.zero then
         for _, cell in {llCell, lrCell, ulCell, urCell} do
             direction = cell[IDX_DIRECTION]
-            break
+            if direction ~= Vector3.zero then
+                break
+            end
         end
     end
     if direction == Vector3.zero then
-        warn("Zero direction!")
+        for _, cell in {llCell, lrCell, ulCell, urCell} do
+            direction = cell[IDX_POSITION] - position
+            if direction ~= Vector3.zero then
+                break
+            end
+        end
+    end
+    if direction == Vector3.zero then
+        error("Direction is zero!")
     end
 
-    return direction
+    return direction.Unit * GRID_COORD_SPACING
 end
 FlowField.GetDirection = GetDirection
 
