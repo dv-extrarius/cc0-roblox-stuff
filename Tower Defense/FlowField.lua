@@ -6,25 +6,30 @@ To view a copy of this license, visit http://creativecommons.org/publicdomain/ze
 This is an implementation of an essentially 2d pathfinding system. It ignores Y coordinates, and
 uses a grid of cells that are manually marked blocked or unblocked by the library's user.
 
-This version uses flow fields, where each cell has a direction attribute that units in that cell can
-follow to the goal. For better appearance, the direction is computed using bilinear interpolation from the
-four surrounding cells.
+This version uses flow fields, where each cell has a direction attribute that units can follow to the goal.
+For smoother paths, the direction for a point is computed using bilinear interpolation from the four surrounding cells.
 
 As far as I know, the way the directions are computed is novel. To get directions beyond the base 8 possible
-from the 4-connected cells, an origin point is tracked that the cells point to. Initially, each goal is an
-origin and cells point to the origin of their parent nodes. Each time a cell has a blocked neighbor that isn't
-a parent node, vector rejection is used to move the origin point for that cell so the direction will point just past the obstacle.
-If an unblocked cell has a blocked cell as a parent, that means it isn't directly reachable, so to get to a goal
-will require going through blocked cells. Accounting for this ensures that blocked cells always point towards a
-path to the goal, even if it goes through obstacles, so that a unit that finds itself suddenly in a blocked
-area can still make progress.
-Each origin additionally tracks angles that are blocked from it, so that child nodes not next to a blocker still
-account for any blocked areas to pick the lowest cost origin they can reach.
+from the 4-connected cells, an "origin" is tracked that a cell points towards, making new origins as the line
+to previous origins is blocked by blocked cells.
+
+Initial origins are created at each goal cell and the goal cell points to it.
+A breadth-first wave expansion is used to calculate approximate distance and which cells are parents of which.
+    Important: if a cell has 2 parents with identical costs not on opposite sides, the cost uses a diagonal step instead of 2 steps.
+    This is important because it ensures the origin-finding loop will take shorter paths around obstacles
+    (4-direction distance is too far off euclidian distance, but 8-direction distance is not)
+
+A second pass is done over all cells (except goals - they have an origin already) in a sort of topological-distance order:
+Each blocked cell gets a direction "out" of the blocked area so a unit that gets blocked will find a short way out.
+Each passable cell takes the reachable origin from its parents that results in the lowest-cost path to a goal cell.
+    Reachability is calculated by keeping track of which angles from each origin have met a blocked cell, as well as
+        directly testing whether the direction to an origin crosses a blocked neighbor.
+    Due to the order cells are visited, blocked angles are updated for all current parents' origins after each wave.
+    If the path to all parents' origins is blocked, a new origin is created over a parent with the least cost.
 ]]
 --!strict
 --!optimize 2
 
-local DebugHelp = require(game.ReplicatedStorage.Modules.DebugHelp)
 local FlowField = {}
 
 --Constants used to index the FieldCell type
@@ -55,23 +60,21 @@ type AngleRange = Vector3 --X is start and Y is end (counterclockwise)
 local IDX_ORIGIN_POSITION = 1
 local IDX_ORIGIN_COST_TO_GOAL = 2
 local IDX_ORIGIN_BLOCKED_ANGLES = 3
-local IDX_ORIGIN_BLOCKED_POSITIONS = 4
+--local IDX_ORIGIN_BLOCKED_POSITIONS = 4
 type CellOrigin = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --[[
 type CellOrigin = {
     Position: Vector3,
     CostToGoal: number,
     BlockedAngles: {AngleRange},
-    BlockedPositions: {[number]: true}, --number is the coord index
+--    BlockedPositions: {[number]: true}, --number is the coord index
 }
 ]]
 
 type FieldUpdateCache = {
     FrontWaveTable: {[FieldCell]: true},
     NextWaveTable: {[FieldCell]: true},
-    Next2WaveTable: {[FieldCell]: true},
     FutureWaveTable: {[FieldCell]: true},
-    SortedWaves: {{FieldCell}},
 }
 
 export type Field = {
@@ -94,7 +97,7 @@ FlowField.GRID_COORD_OFFSET = GRID_COORD_OFFSET
 
 --[[
 Before I knew Vector3 were value types, I made my own position-to-key system. After discovering
-they are value types, a benchmark showed my system is about 5% faster for my cast, so here it is.
+they are value types, a benchmark showed my system is about 5% faster for my case, so it remains.
 Since places won't be huge and cells are limited to integer coordinates, we can pack the coordinates
 using some bits for each one. Since there are effectively 53 mantissa bits, I chose floor(53/3) bits
 per coordinate (in case Y is used someday), resulting in a multiplier of 2^17 = 131072.
@@ -110,8 +113,9 @@ local INVALID_ORIGIN: CellOrigin = table.freeze({
     Vector3.zero,                                      --Position
     math.huge,                                         --CostToGoal
     table.freeze({Vector3.new(-math.pi, math.pi, 0)}), --BlockedAngles
-    table.freeze({}),                                  --BlockedPositions
+    --    table.freeze({}),                                  --BlockedPositions
 } :: CellOrigin)
+
 
 --Actual module-local variables
 local EnableDebugMessages: boolean = false
@@ -167,16 +171,6 @@ end
 local function DeltaZCoordToIndex(z: number): number
     --TODO: Maybe take advantage of grid size to increase range?
     return (z * GRID_INDEX_MUL)
-end
-
-
---Combine a pair of indexes into a single one describing a line
-local function CombineIndexesIntoLine(a: number, b: number): number
-    if a <= b then
-        return a + (b * (GRID_INDEX_MUL * GRID_INDEX_MUL))
-    else
-        return b + (a * (GRID_INDEX_MUL * GRID_INDEX_MUL))
-    end
 end
 
 
@@ -258,9 +252,7 @@ function FlowField.NewField(): Field
         UpdateCache = {
             FrontWaveTable = {},
             NextWaveTable = {},
-            Next2WaveTable = {},
             FutureWaveTable = {},
-            SortedWaves = {},
         },
     }
 end
@@ -268,7 +260,6 @@ end
 
 --Clone a field. Finalizes the cells if the original is finialized
 function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
-
     local newField: Field = {
         Cells = {},
         SortedCells = table.create(#oldField.SortedCells),
@@ -278,9 +269,7 @@ function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
         UpdateCache = {
             FrontWaveTable = {},
             NextWaveTable = {},
-            Next2WaveTable = {},
             FutureWaveTable = {},
-            SortedWaves = {},
         },
     }
     local oldCells = oldField.Cells
@@ -808,6 +797,18 @@ local function SquareAnglesExpanded(origin:Vector3, squareCenter: Vector3): (num
     end
 end
 
+
+local function MakeOrigin(position: Vector3, costToGoal: number): CellOrigin
+    local origin: CellOrigin = {
+        position,        --Position
+        costToGoal,      --CostToGoal
+        table.create(1), --BlockedAngles
+        --        {},              --BlockedPositions
+    }
+    return origin
+end
+
+
 --Update the costs so the field points the way to the goal
 local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
     --Updating the costs requires a finalized field
@@ -815,6 +816,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
         CustomError(1, "Attempted UpdateField without finalizing the field.")
         return false
     end
+
     local cells = field.Cells
     local borderCells = field.BorderCells
 
@@ -838,18 +840,19 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
     table.clear(nextWave)
     table.clear(futureWave)
 
+    --Info used to update angle ranges for origins
+    local originUpdates: {[CellOrigin]: {[number]: Vector3}} = {}
+
     --Initialize goal cells to 0 distance and set the first wave you contain them
     for _, goalCell in goalCells do
         frontWave[goalCell] = true
         goalCell[IDX_CELL_TOTALCOST] = 0
-        goalCell[IDX_CELL_ORIGIN] = {
-            goalCell[IDX_CELL_POSITION], --Position
-            0,                      --CostToGoal
-            table.create(1),        --BlockedAngles
-            {},                     --BlockedPositions
-        }
+        local origin = MakeOrigin(goalCell[IDX_CELL_POSITION], 0)
+        goalCell[IDX_CELL_ORIGIN] = origin
+        originUpdates[origin] = {}
     end
 
+    --debug.profilebegin("WaveExpansion")
     local currentWaveNumber = 0
     repeat
         --Exhaust the current wave to update cost of all reachable areas
@@ -885,7 +888,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                     if (minParentCost < myCost) and (numMatchingParents == 2) then
                         averageParentCoord /= numMatchingParents
                         --And the two parents are not on opposite sides
-                        if not averageParentCoord:FuzzyEq(myPosition) then
+                        if not averageParentCoord:FuzzyEq(myPosition, 0.00001) then
                             --Adjust cost as if diagonal movement were allowed
                             myCost += (1.4143 - 2)
                             totalCost = myCost + 1
@@ -893,6 +896,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         end
                     end
                 end
+
                 --Process each neighbor to see which cells should be expanded from here
                 for _, neighbor in currentCell[IDX_CELL_NEIGHBORS] do
                     local neighborIsBlocked = neighbor[IDX_CELL_BLOCKED]
@@ -901,6 +905,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         --Blocked neighbors get extra cost to ensure they're not desirable paths
                         local neighborIndex = neighbor[IDX_CELL_INDEX]
                         if (blockedTotalCost < neighbor[IDX_CELL_TOTALCOST]) and not borderCells[neighborIndex] then
+                            --Explore blocked neighbors in a future wave, since their neighbors are probably neighbors soon-visited unblocked nodes
                             neighbor[IDX_CELL_TOTALCOST] = blockedTotalCost
                             futureWave[neighbor] = true
                         end
@@ -917,6 +922,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                     end
                 end
             end
+            --Advance to the next wave, which is updated neighbors of the current wave
             frontWave, nextWave = nextWave, frontWave
             table.clear(nextWave)
         end
@@ -925,9 +931,11 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
         table.clear(futureWave)
     until not next(frontWave)
 
+    --debug.profileend()
+
     --Bin cells into waves based on when they were explored to ensure parent cells are updated before their children
-    local sortedWaves = field.UpdateCache.SortedWaves
-    for i = #sortedWaves, currentWaveNumber do
+    local sortedWaves = table.create(currentWaveNumber)
+    for i = 1, currentWaveNumber do
         sortedWaves[i] = {}
     end
     for index, cell in cells do
@@ -944,32 +952,18 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
     local blockedDirections: {Vector3} = table.create(4)
     local parentOrigins: {CellOrigin} = table.create(4)
     local parents: {FieldCell} = table.create(4)
-    --unfortunately no table.create equivalent for dictionaries, so fill in some junk to hopefully create enough entries to avoid collisions
-    local blockedPositions: {[number]: Vector3} = {
-        [COORD_INDEX_BASE+0] = Vector3.zero,
-        [COORD_INDEX_BASE+1] = Vector3.zero,
-        [COORD_INDEX_BASE+2] = Vector3.zero,
-        [COORD_INDEX_BASE+3] = Vector3.zero,
-        [COORD_INDEX_BASE+4] = Vector3.zero,
-        [COORD_INDEX_BASE+5] = Vector3.zero,
-        [COORD_INDEX_BASE+6] = Vector3.zero,
-        [COORD_INDEX_BASE+7] = Vector3.zero,
-        [COORD_INDEX_BASE+8] = Vector3.zero,
-        [COORD_INDEX_BASE+9] = Vector3.zero,
-    }
-    local originUpdates: {[CellOrigin]: {[number]: Vector3}} = {}
-    --Several pieces of information about neighbors are needed to compute directions for each non-blocked cell
+    local blockedPositions: {[number]: Vector3} = {}--unfortunately no table.create equivalent for dictionaries
+
+    --Several pieces of information about neighbors are needed to compute directions for each blocked cell
     local unblockedParentDirections: {Vector3} = table.create(4)
     local blockedParentDirections: {Vector3} = table.create(4)
 
+    --debug.profilebegin("AssignOrigins")
     --Process all the nodes in the waves they were
     for myWave, currentWave in sortedWaves do
-        --early exit since sortedWaves is a cached thing
-        if myWave > currentWaveNumber then
-            break
+        if #currentWave > 1 then
+            table.sort(currentWave, function (a, b) return a[IDX_CELL_TOTALCOST] < b[IDX_CELL_TOTALCOST] end)
         end
-        table.sort(currentWave, function (a, b) return a[IDX_CELL_TOTALCOST] < b[IDX_CELL_TOTALCOST] end)
-        table.clear(originUpdates)
 
         for _, currentCell in currentWave do
             local myCost = currentCell[IDX_CELL_TOTALCOST]
@@ -978,6 +972,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
 
 
             if myIsBlocked then
+                --debug.profilebegin("BlockedCell")
                 --Blocked cells just need to point to nearby unblocked cells
                 table.clear(unblockedParentDirections)
                 table.clear(blockedParentDirections)
@@ -1015,6 +1010,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         end
                     end
                     table.insert(sortedWaves[newWaveNumber], currentCell)
+                    --debug.profileend()
                     continue
                 end
 
@@ -1044,13 +1040,17 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                 end
 
                 currentCell[IDX_CELL_DIRECTION] = GRID_COORD_SPACING * SafeUnit(meanDirection)
-
+                --debug.profileend()
             else ----------------------------------------------------------------------------------------------------------------------------------
+
+                --debug.profilebegin("PassableCell")
+
                 table.clear(blockedDirections)
                 table.clear(parentOrigins)
                 table.clear(parents)
                 table.clear(blockedPositions)
 
+                --debug.profilebegin("ScanNeighbors")
                 local nearestNeighborWave = math.huge
                 for _, neighbor in currentCell[IDX_CELL_NEIGHBORS] do
                     local neighborWave = neighbor[IDX_CELL_WAVENUMBER]
@@ -1073,6 +1073,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         blockedPositions[neighborIndex] = neighborPosition
                     end
                 end
+                --debug.profileend()
 
                 --If this cell doesn't have parents yet, reschedule it for a later wave
                 if #parents == 0 then
@@ -1085,10 +1086,12 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         end
                     end
                     table.insert(sortedWaves[newWaveNumber], currentCell)
+                    --debug.profileend()
                     continue
                 end
 
                 --Examine all the origins of parent cells to find the best one for this cell
+                --debug.profilebegin("Origins")
                 local bestOrigin: CellOrigin = nil
                 local bestOriginCost = math.huge
                 for _, origin in parentOrigins do
@@ -1096,6 +1099,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         continue
                     end
                     if next(blockedPositions) then
+                        --debug.profilebegin("ScheduleUpdates")
                         --Insert future updates for all blocked neighbors
                         local updates = originUpdates[origin]
                         if not updates then
@@ -1105,16 +1109,21 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         for blockedIndex, blockedPosition in blockedPositions do
                             updates[blockedIndex] = blockedPosition
                         end
+                        --debug.profileend()
                     end
+                    --debug.profilebegin("OriginTests")
                     --Check if this origin can be the best one and is valid for this cell
                     local deltaFromOrigin = myPosition - origin[IDX_ORIGIN_POSITION]
                     local originCost = origin[IDX_ORIGIN_COST_TO_GOAL] + deltaFromOrigin.Magnitude
                     if originCost >= bestOriginCost then
+                        --debug.profileend()
+                        continue
+                    elseif DoesAngleRangeContainAngle(origin[IDX_ORIGIN_BLOCKED_ANGLES], math.atan2(deltaFromOrigin.Z, deltaFromOrigin.X)) then
+                        --debug.profileend()
                         continue
                     end
-                    if DoesAngleRangeContainAngle(origin[IDX_ORIGIN_BLOCKED_ANGLES], math.atan2(deltaFromOrigin.Z, deltaFromOrigin.X)) then
-                        continue
-                    end
+                    --debug.profileend()
+                    --debug.profilebegin("OriginValidate")
                     local deltaFromCell = -deltaFromOrigin
                     local isOriginBlocked = false
                     for _, blockedDirection in blockedDirections do
@@ -1130,9 +1139,13 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                         bestOrigin = origin
                         bestOriginCost = originCost
                     end
+                    --debug.profileend()
                 end
+                --debug.profileend()
+
                 --If no parent cells are good candidates, make a new origin for this cell in one of its parents
                 if not bestOrigin then
+                    --debug.profilebegin("MakeNewOrigin")
                     local bestOriginPosition = myPosition
                     for _, parent in parents do
                         local parentPosition: Vector3 = parent[IDX_CELL_POSITION]
@@ -1144,61 +1157,61 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                             parentCost = parent[IDX_CELL_TOTALCOST]
                         end
                         if parentCost < bestOriginCost then
-                            --origin variable is necessary because type system believes bestOrigin is only nil in this whole block
                             bestOriginPosition = parentPosition
                             bestOriginCost = parentCost
                         end
                     end
-                    bestOrigin = {
-                        bestOriginPosition, --Position
-                        bestOriginCost,     --CostToGoal
-                        table.create(1),    --BlockedAngles
-                        {},                 --BlockedPositions
-                    }
+                    bestOrigin = MakeOrigin(bestOriginPosition, bestOriginCost)
+
                     --Ensure a new origin gets proper updates
-                    local updates = originUpdates[(bestOrigin :: any) :: CellOrigin]
-                    if not updates then
-                        updates = {}
-                        originUpdates[(bestOrigin :: any) :: CellOrigin] = updates
-                    end
+                    local updates = {}
+                    originUpdates[(bestOrigin :: any) :: CellOrigin] = updates
                     for blockedIndex, blockedPosition in blockedPositions do
                         updates[blockedIndex] = blockedPosition
                     end
+                    --debug.profileend()
                 end
 
                 currentCell[IDX_CELL_ORIGIN] = bestOrigin
                 currentCell[IDX_CELL_DIRECTION] = GRID_COORD_SPACING * SafeUnit(bestOrigin[IDX_ORIGIN_POSITION] - myPosition)
+                --debug.profileend()
             end
         end
 
+        --debug.profilebegin("UpdateOrigins")
         --Apply all updates to origins
-        for origin, blockedPositions in originUpdates do
+        for origin, blockedCellPositions in originUpdates do
+            --local updated = false
             local originPosition = origin[IDX_ORIGIN_POSITION]
-            local blockedOriginPositions = origin[IDX_ORIGIN_BLOCKED_POSITIONS]
+            --local blockedOriginPositions = origin[IDX_ORIGIN_BLOCKED_POSITIONS]
             local originBlockedAngles = origin[IDX_ORIGIN_BLOCKED_ANGLES]
-            for blockedIndex, blockedPosition in blockedPositions do
-                if not blockedOriginPositions[blockedIndex] then
-                    blockedOriginPositions[blockedIndex] = true
-                    local startAngle, endAngle = SquareAnglesExpanded(originPosition, blockedPosition)
-                    originBlockedAngles = AddAngleToAngleRange(originBlockedAngles, Vector3.new(startAngle, endAngle, 0))
-                end
+            for blockedIndex, blockedCellPosition in blockedCellPositions do
+                --if not blockedOriginPositions[blockedIndex] then
+                --    blockedOriginPositions[blockedIndex] = true
+                local startAngle, endAngle = SquareAnglesExpanded(originPosition, blockedCellPosition)
+                originBlockedAngles = AddAngleToAngleRange(originBlockedAngles, Vector3.new(startAngle, endAngle, 0))
+                --    updated = true
+                --end
             end
+            --if updated then
             origin[IDX_ORIGIN_BLOCKED_ANGLES] = originBlockedAngles
+            --end
         end
-
-        --Ensure the cache is cleared for next reuse
-        table.clear(currentWave)
+        table.clear(originUpdates)
+        --debug.profileend()
     end
+    --debug.profileend()
 
     ----Debug aid:
-    ----Update total cost to the be difference between calculated total cost and actual distance
+    ----Set total cost to the be ratio between calculated total cost and actual distance (for reachable cells)
     --for index, currentCell in cells do
     --    local myPosition: Vector3 = currentCell[IDX_CELL_POSITION]
     --    local myOrigin: CellOrigin = currentCell[IDX_CELL_ORIGIN]
-
     --    local myCost = currentCell[IDX_CELL_TOTALCOST]
-    --    local actualCost = (myOrigin[IDX_ORIGIN_COST_TO_GOAL] + (myOrigin[IDX_ORIGIN_POSITION] - myPosition).Magnitude) / GRID_COORD_SPACING
-    --    currentCell[IDX_CELL_TOTALCOST] = (myCost / actualCost) * 100 --overestimate as percentage
+    --    if (myOrigin ~= INVALID_ORIGIN) and (myCost < EXTRA_BLOCKED_CELL_COST) then
+    --        local actualCost = (myOrigin[IDX_ORIGIN_COST_TO_GOAL] + (myOrigin[IDX_ORIGIN_POSITION] - myPosition).Magnitude) / GRID_COORD_SPACING
+    --        currentCell[IDX_CELL_TOTALCOST] = (myCost / actualCost) * 100 --estimate as percentage of actual
+    --    end
     --end
 
     return true
@@ -1489,11 +1502,11 @@ local function GetDirection(field: Field, position: Vector3): Vector3
 
     local deltaX = delta.X
     local deltaZ = delta.Z
-    local oneMinusX = (1 - deltaX)
-    local oneMinusZ = (1 - deltaZ)
+    local oneMinusDeltaX = (1 - deltaX)
+    local oneMinusDeltaZ = (1 - deltaZ)
 
     if llCell then
-        local mul = oneMinusX * deltaZ
+        local mul = oneMinusDeltaX * deltaZ
         direction += mul * llCell[IDX_CELL_DIRECTION]
         directionDivisor += mul
         table.insert(backupOrder, llCell)
@@ -1505,13 +1518,13 @@ local function GetDirection(field: Field, position: Vector3): Vector3
         table.insert(backupOrder, lrCell)
     end
     if ulCell then
-        local mul = oneMinusX * oneMinusZ
+        local mul = oneMinusDeltaX * oneMinusDeltaZ
         direction += mul * ulCell[IDX_CELL_DIRECTION]
         directionDivisor += mul
         table.insert(backupOrder, ulCell)
     end
     if urCell then
-        local mul = deltaX * oneMinusZ
+        local mul = deltaX * oneMinusDeltaZ
         direction += mul * urCell[IDX_CELL_DIRECTION]
         directionDivisor += mul
         table.insert(backupOrder, urCell)
