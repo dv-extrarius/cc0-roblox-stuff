@@ -41,6 +41,7 @@ local IDX_CELL_BLOCKED = 5
 local IDX_CELL_DIRECTION = 6
 local IDX_CELL_WAVENUMBER = 7
 local IDX_CELL_ORIGIN = 8
+local IDX_CELLBORDER_IDSTRING = 9 --This index MUST NOT EXIST in normal cells
 
 type FieldCell = {any} --Unfortuantely heterogeneous arrays not yet supported in type system
 --[[
@@ -361,7 +362,7 @@ local function MakeBorderCell(neighborIndex: number, borderPosition: Vector3): F
         Vector3.zero,         --Direction
         math.huge,            --WaveNumber
         INVALID_ORIGIN,       --Origin
-        borderCellStr --extra to make them obvious
+        borderCellStr         --IDX_CELLBORDER_IDSTRING
     } :: FieldCell
 end
 
@@ -818,7 +819,6 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
     end
 
     local cells = field.Cells
-    local borderCells = field.BorderCells
 
     --Reset costs to maximum value
     for _, cell in cells do
@@ -904,7 +904,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                     if neighborIsBlocked then
                         --Blocked neighbors get extra cost to ensure they're not desirable paths
                         local neighborIndex = neighbor[IDX_CELL_INDEX]
-                        if (blockedTotalCost < neighbor[IDX_CELL_TOTALCOST]) and not borderCells[neighborIndex] then
+                        if (blockedTotalCost < neighbor[IDX_CELL_TOTALCOST]) and not neighbor[IDX_CELLBORDER_IDSTRING] then
                             --Explore blocked neighbors in a future wave, since their neighbors are probably neighbors soon-visited unblocked nodes
                             neighbor[IDX_CELL_TOTALCOST] = blockedTotalCost
                             futureWave[neighbor] = true
