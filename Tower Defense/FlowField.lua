@@ -1039,7 +1039,7 @@ local function UpdateField(field: Field, goalCells: {FieldCell}): boolean
                     end
                 end
 
-                currentCell[IDX_CELL_DIRECTION] = GRID_COORD_SPACING * SafeUnit(meanDirection)
+                currentCell[IDX_CELL_DIRECTION] = 4 * GRID_COORD_SPACING * SafeUnit(meanDirection)
                 --debug.profileend()
             else ----------------------------------------------------------------------------------------------------------------------------------
 
