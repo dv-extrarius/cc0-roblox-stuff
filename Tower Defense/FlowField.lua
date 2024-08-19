@@ -703,99 +703,65 @@ local function DoesAngleRangeContainAngle(ranges: {AngleRange}, angle: number): 
     return false
 end
 
---Calculate the angle range occluded by a square from a given origin
-local function SquareAnglesEfficient(origin: Vector3, squareCenter: Vector3): (number, number)
+
+--Calculate the angle range occluded by a square from a given origin, expanded to account for "unit" size equal to grid size
+local function SquareAnglesExpanded(origin: Vector3, squareCenter: Vector3): (number, number)
     local halfGridSpacing = 0.5 * GRID_COORD_SPACING
 
     local delta = squareCenter - origin
+
     local xCenter = delta.X
     local yCenter = delta.Z
-
+    --Center adjusted to be in quadruant 1
     local absXCenter = math.abs(xCenter)
     local absYCenter = math.abs(yCenter)
+    --Perpendicular offsets to account for object radius
+    local du = delta.Unit
+    local perpX = math.abs(du.Z) * halfGridSpacing
+    local perpY = -math.abs(du.X) * halfGridSpacing
 
-    local xPlus = absXCenter + halfGridSpacing
-    local yPlus = absYCenter + halfGridSpacing
-    local xMinus = absXCenter - halfGridSpacing
-    local yMinus = absYCenter - halfGridSpacing
-
-    --Most cases use corners 3 and 1 so initialize to those
-    local xCornerA: number = xPlus
-    local yCornerA: number = yMinus
-    local xCornerB: number = xMinus
-    local yCornerB: number = yPlus
-
-    --If the square is close to either axis, a different corner must be used
-    if (absXCenter < halfGridSpacing) then
-        --Use corners 3 and 2
-        yCornerB = yMinus
-    elseif (absYCenter < halfGridSpacing) then
-        --Use corners 2 and 1
-        xCornerA = xMinus
+    --Corners Offsets from Center: (1) -X,+Y;  (2) -X,-Y; (3) +X,-Y
+    --Use cornerA = 3 or 2 depending on whether the square crosses Y axis
+    local xCornerA: number = absXCenter
+    local yCornerA: number = absYCenter - halfGridSpacing + perpY
+    if (yCornerA < 0) then
+        --Use cornerA = 2 when crossig Y axis
+        xCornerA -= halfGridSpacing
+    else
+        --Use cornerA = 3 otherwise
+        xCornerA += halfGridSpacing
     end
+    xCornerA += perpX
+
+    --Use CornerB = 1 or 2 depending on whether the square crosses X axis
+    local xCornerB: number = absXCenter - halfGridSpacing - perpX
+    local yCornerB: number = absYCenter
+    if (xCornerB < 0) then
+        --Use cornerB = 2 when crossing X axis
+        yCornerB -= halfGridSpacing
+    else
+        --Use cornerB = 1 otherwise
+        yCornerB += halfGridSpacing
+    end
+    yCornerB -= perpY
 
     local thetaA = math.atan2(yCornerA, xCornerA)
     local thetaB = math.atan2(yCornerB, xCornerB)
 
+    --Adjust for original quadruant
     if xCenter < 0 then
+        --Originally quadruant 2 or 4
         thetaB, thetaA = (math.pi - thetaA), (math.pi - thetaB)
     end
     if yCenter < 0 then
+        --Originally quadrant 3 or 4
         thetaB, thetaA = -thetaA, -thetaB
     end
+    --Wrap to range -pi..pi
     thetaB = (thetaB + math.pi) % TAU - math.pi
     thetaA = (thetaA + math.pi) % TAU - math.pi
 
     return thetaA, thetaB
-end
-
---Calculate the angle range occluded by a square from a given origin, expanded to account for "unit" size equal to grid size
-local function SquareAnglesExpanded(origin:Vector3, squareCenter: Vector3): (number, number)
-    local halfGridSpacing = 0.5 * GRID_COORD_SPACING
-
-    local delta = squareCenter - origin
-    local du = delta.Unit
-    local perpendicular = halfGridSpacing * Vector3.new(du.Z, 0, -du.X)
-
-    local startAngleA, endAngleA = SquareAnglesEfficient(origin + perpendicular, squareCenter)
-    local startAngleB, endAngleB = SquareAnglesEfficient(origin - perpendicular, squareCenter)
-
-    --Find the biggest gap in the angles to find the two extremes that define the span
-    --Sadly, using a table plus table.sort is significantly slower
-    local angles1 = startAngleA
-    local angles2 = endAngleA
-    local angles3 = startAngleB
-    local angles4 = endAngleB
-    if angles1 > angles3 then
-        angles1, angles3 = angles3, angles1
-    end
-    if angles2 > angles4 then
-        angles2, angles4 = angles4, angles2
-    end
-    if angles1 > angles2 then
-        angles1, angles2 = angles2, angles1
-    end
-    if angles3 > angles4 then
-        angles3, angles4 = angles4, angles3
-    end
-    if angles2 > angles3 then
-        angles2, angles3 = angles3, angles2
-    end
-    --Avoid a list here to limit GC. Using a list doesn't add anything besides nicer syntax, anyway
-    local angleDiffs1 = angles2 - angles1
-    local angleDiffs2 = angles3 - angles2
-    local angleDiffs3 = angles4 - angles3
-    local angleDiffs4 = angles1 - angles4 + TAU
-    local maxAngleDiff = math.max(angleDiffs1, angleDiffs2, angleDiffs3, angleDiffs4)
-    if angleDiffs1 == maxAngleDiff then
-        return angles2, angles1
-    elseif angleDiffs2 == maxAngleDiff then
-        return angles3, angles2
-    elseif angleDiffs3 == maxAngleDiff then
-        return angles4, angles3
-    else--if angleDiffs4 == maxAngleDiff then
-        return angles1, angles4
-    end
 end
 
 
