@@ -237,7 +237,7 @@ FlowField.AlignAreaToGrid = AlignAreaToGrid
 --Initialize FlowField with the provided settings
 function FlowField.Configure(config: {EnableDebugMessages: boolean?}): ()
     if config.EnableDebugMessages ~= nil then
-        EnableDebugMessages = config.EnableDebugMessages and true or false --cast to boolean
+        EnableDebugMessages = config.EnableDebugMessages and true
     end
 end
 
@@ -263,10 +263,10 @@ end
 function FlowField.Clone(oldField: Field, skipFinalize: boolean?): Field
     local newField: Field = {
         Cells = {},
-        SortedCells = table.create(#oldField.SortedCells),
+        SortedCells = table.create(#oldField.SortedCells) :: {FieldCell},
         BorderCells = {},
         IsFinalized = false,
-        GoalCells = table.create(#oldField.GoalCells),
+        GoalCells = table.create(#oldField.GoalCells) :: {FieldCell},
         UpdateCache = {
             FrontWaveTable = {},
             NextWaveTable = {},
@@ -372,7 +372,6 @@ function FlowField.FinalizeField(field: Field): ()
     local cells = field.Cells
     local borderCells = field.BorderCells
     local sorted = field.SortedCells
-    local neighbor: FieldCell?
     local neighborIndex: number
 
     --Make the sorted cells actually sorted (by index)
@@ -381,6 +380,7 @@ function FlowField.FinalizeField(field: Field): ()
     --Connect each cell to 4-way neighbors if they exist and create border cells if they don't
     for index, currentCell in cells do
         local neighbors: {FieldCell} = currentCell[IDX_CELL_NEIGHBORS]
+        local neighbor: FieldCell?
 
         neighborIndex = index + DeltaXCoordToIndex(-GRID_COORD_SPACING)
         neighbor = cells[neighborIndex] or borderCells[neighborIndex]
@@ -423,31 +423,32 @@ function FlowField.FinalizeField(field: Field): ()
 
     --Set direction for border cells to be away from all non-border neighbors
     for index, borderCell in borderCells do
-        local myPosition = borderCell[IDX_CELL_POSITION]
-        local direction = Vector3.zero
+        local myPosition: Vector3 = borderCell[IDX_CELL_POSITION]
+        local direction: Vector3 = Vector3.zero
+        local neighbor: FieldCell?
 
         neighborIndex = index + DeltaXCoordToIndex(-GRID_COORD_SPACING)
         neighbor = cells[neighborIndex]
         if neighbor then
-            direction += (neighbor[IDX_CELL_POSITION] - myPosition)
+            direction += ((neighbor[IDX_CELL_POSITION] :: Vector3) - myPosition)
         end
 
         neighborIndex = index + DeltaXCoordToIndex(GRID_COORD_SPACING)
         neighbor = cells[neighborIndex]
         if neighbor then
-            direction += (neighbor[IDX_CELL_POSITION] - myPosition)
+            direction += ((neighbor[IDX_CELL_POSITION] :: Vector3) - myPosition)
         end
 
         neighborIndex = index + DeltaZCoordToIndex(-GRID_COORD_SPACING)
         neighbor = cells[neighborIndex]
         if neighbor then
-            direction += (neighbor[IDX_CELL_POSITION] - myPosition)
+            direction += ((neighbor[IDX_CELL_POSITION] :: Vector3) - myPosition)
         end
 
         neighborIndex = index + DeltaZCoordToIndex(GRID_COORD_SPACING)
         neighbor = cells[neighborIndex]
         if neighbor then
-            direction += (neighbor[IDX_CELL_POSITION] - myPosition)
+            direction += ((neighbor[IDX_CELL_POSITION] :: Vector3) - myPosition)
         end
 
         borderCell[IDX_CELL_DIRECTION] = direction.Unit * GRID_COORD_SPACING
@@ -617,7 +618,7 @@ local function SafeUnit(vec: Vector3) :Vector3
     end
 end
 
-local angleRangesCache = table.create(1)
+local angleRangesCache: {AngleRange} = (table.create(1) :: any)
 --Create a new angle range from an existin range and a new range. Steals the input list for cache use
 local function AddAngleToAngleRange(ranges: {AngleRange}, addRange: AngleRange): {AngleRange}
     --If the angle straddles the wrap from +180 to -180, we have to break it up into two angle ranges
@@ -626,7 +627,7 @@ local function AddAngleToAngleRange(ranges: {AngleRange}, addRange: AngleRange):
         addRange = Vector3.new(-math.pi, addRange.Y, 0)
     end
 
-    local numRanges = #ranges
+    local numRanges: number = #ranges
     if numRanges == 0 then
         --(#1 most common case) If this is the first range inserted, just set it
         ranges[1] = addRange
